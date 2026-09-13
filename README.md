@@ -1,6 +1,6 @@
 # writing_assistant
 
-多 Agent ReAct 学术论文写作助手。输入种子论文 PDF、参考文献 PDF、创新点/实验描述等手稿，自动产出可编译的 LaTeX 论文（`main.tex` + `references.bib` + `main.pdf`）。基于 DeepSeek 的 Anthropic 兼容 API。
+多 Agent ReAct 学术论文写作助手。输入种子论文 PDF、参考文献 PDF、创新点/实验描述等手稿，自动产出可编译的 LaTeX 论文（`main.tex` + `references.bib` + `main.pdf`）
 
 ## 功能特性
 
@@ -13,20 +13,19 @@
 - **三种运行范式可配**：ReAct / Plan-Execute / Reflection，按 Agent 单独配置
 - **权限隔离的共享上下文**：`AgentContextView` 按字段控制每个 Agent 的读写范围
 - **记忆系统**：情景记忆 + TF-IDF 长期记忆，按 Agent 独立持久化
-- **精确 token 计数**：DeepSeek 官方 BPE 词表，带渐进式上下文压缩（缺失词表时自动回退启发式）
 - **产出闸门**：Agent 结束前校验必需产出文件已写出且非空
-- **并行工具**：PDF 批量解析、引用批量核查使用线程池；Semantic Scholar 429 自动指数退避重试
+- **并行工具**：PDF 批量解析、引用批量核查
 
 ## Quickstart
 
 ### 1. 准备环境
 
-要求 Python 3.12，系统已安装 LaTeX（MiKTeX 或 TeX Live，需含 `pdflatex`、`bibtex`）。依赖说明详见 [requirements.md](requirements.md)。
+要求 Python 3.12，系统已安装 LaTeX（MiKTeX 或 TeX Live，需含 `pdflatex`、`bibtex`）
 
 ```bash
 conda create -n agent python=3.12 -y
 conda activate agent
-pip install anthropic==0.122.0 PyYAML==6.0.3 PyMuPDF==1.28.0 python-dotenv==1.2.2 tokenizers==0.22.2
+pip install -r requirements.md
 ```
 
 ### 2. 配置环境变量
@@ -80,7 +79,7 @@ writing_assistant/
 ├── main.py                     # 入口：加载 config.yaml → 构建 PaperContext → 装配 6 个 Agent → 交互运行
 ├── config.yaml                 # 全局配置：路径、LLM 模型、各 Agent max_steps/run_mode、记忆参数
 ├── .env.example                # 环境变量模板（复制为 .env 并填入 API Key）
-├── requirements.md             # Python 版本与依赖说明
+├── requirements.md             # Python 依赖清单（pip install -r requirements.md）
 ├── resources/
 │   └── ds-v4/tokenizer.json    # DeepSeek BPE 词表，token 精确计数用（缺失自动回退）
 ├── example/                    # 工作区：仅上传空目录结构，材料/产出均不入 git
