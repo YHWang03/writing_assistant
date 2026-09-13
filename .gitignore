@@ -1,0 +1,25 @@
+# ===== 密钥 / 环境变量 =====
+.env
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# ===== 运行时产物 =====
+logs/
+memory/*.json
+
+# ===== example/：仅上传空目录结构，具体文件一律不上传 =====
+/example/**
+!/example/**/
+!/example/**/.gitkeep
+
+# ===== 按要求不上传的内容 =====
+tests/
+note.md
+PROJECT_LOG.md

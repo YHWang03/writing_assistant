@@ -1,0 +1,61 @@
+# writing_assistant 配置文件
+# 论文写作助手的全局配置
+
+# === 路径配置 ===
+paths:
+  output_dir: "example/output"            # 输出目录
+  template_dir: "example/journal_tex"     # LaTeX 模板目录
+  seed_dir: "example/refs"                # 种子论文 PDF 目录
+  refs_dir: "example/reference"           # 用户补充论文 PDF 目录
+  library_dir: "example/library"          # 持久文献库目录（信息完备的 JSON 文献库）
+
+# === 论文配置 ===
+paper:
+  innovation_points: "example/input/innovations.txt"         # 创新点描述文件路径
+  experiment_description: "example/experiments/description.txt"  # 实验描述文件路径
+  experiment_images: "example/experiments"                   # 实验图片目录路径
+  formula_manuscript: "example/input/formula.tex"            # 公式手稿文件路径
+  user_prompt: "example/input/prompt.txt"                    # 用户提示词文件路径
+
+# === LLM 配置 ===
+llm:
+  model: "deepseek-v4-pro"         # 主模型（Master/Writing/Citation/Review/Build 等推理任务）
+  flash_model: "deepseek-v4-flash" # 快速模型（工具内部：PDF 提取、总结、引用比对等）
+
+# === Agent 配置 ===
+agents:
+  # Agent 运行范式: react | plan_execute | reflection
+  # 两种写法：
+  #   1) 全局统一：run_mode: react
+  #   2) 按 Agent 覆盖（default 为全局默认，未列出的 Agent 沿用 default）：
+  #      run_mode:
+  #        default: react
+  #        LiteratureAgent: plan_execute
+  run_mode:
+    default: react
+    LiteratureAgent: plan_execute
+  master:
+    max_steps: 30                  # 主 Agent 最大步数
+    max_tokens: 8192
+  literature:
+    max_steps: 20
+    max_tokens: 8192
+    min_relevant: 15            # 从持久文献库检索相关文献的最少数量阈值
+  writing:
+    max_steps: 15
+    max_tokens: 8192
+  citation:
+    max_steps: 15
+    max_tokens: 8192
+  review:
+    max_steps: 15
+    max_tokens: 8192
+  build:
+    max_steps: 15
+    max_tokens: 8192
+
+# === 记忆配置 ===
+memory:
+  long_term_max_size: 500          # 长期记忆最大条数
+  episodic_max_size: 200           # 情景记忆最大条数
+  # 长期记忆文件按 Agent 自动命名：memory/{agent_name}_long_term.json
