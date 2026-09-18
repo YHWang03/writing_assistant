@@ -25,6 +25,17 @@ LARGE_CONTENT_TOOLS = {
     "compile_latex", "parse_latex_log",
 }
 
+# 路径指针替换的最小结果长度：小于此值不值得替换（保留原样）
+STUB_MIN_CHARS = 400
+
+# API 上下文超限错误的特征串（小写匹配，覆盖 Anthropic / OpenAI / DeepSeek 常见报错）
+CONTEXT_OVERFLOW_PATTERNS = (
+    "prompt is too long", "prompt too long",
+    "context_length_exceeded", "maximum context length",
+    "context length exceeded", "input length exceeds",
+    "request too large", "too many tokens",
+)
+
 
 def serialize_for_compression(messages: list) -> str:
     """将消息列表序列化为结构化元数据，不保留大文件原始内容。
@@ -67,7 +78,7 @@ def serialize_for_compression(messages: list) -> str:
                         md = inp.get("mode", "write")
                         sz = len(inp.get("content", "") or "")
                         lines.append(f"[{role}/tool_use]: write_file(path={fp}, mode={md}, content_size={sz})")
-                    elif name in ("search_papers", "verify_paper", "search_template"):
+                    elif name in ("search_papers", "verify_paper"):
                         lines.append(f"[{role}/tool_use]: {name}({inp_str[:200]})")
                     else:
                         lines.append(f"[{role}/tool_use]: {name}({inp_str[:300]})")
@@ -246,6 +257,120 @@ def compress_history(history: list[Message], keep_recent: int, context_window: i
     ] + recent_messages
 
 # messages: list[dict] 中的每个 dict 都包含 role 和 content 键
+def _stub_large_tool_results(messages: list[dict], keep_recent: int) -> list:
+    """路径指针替换：把旧消息中大内容工具的 tool_result 替换为文件路径指针。
+
+    零 LLM 调用的确定性减负（s08 的 micro_compact 思想）：
+    read_file/parse_pdf 等结果已被模型消费过，文件仍在磁盘上，
+    替换为 "[结果已省略 — 文件 {path} 共 N 字符；需要时重新调用 {tool}]" 指针即可，
+    Agent 需要时可重新读取。只动 content 字符串，不增删消息，
+    tool_use/tool_result 配对完整保留。
+
+    keep_recent=0 表示全库替换（reactive_compact 的最后手段用）。
+    返回新列表（copy-on-write），无替换时返回原列表对象。
+    """
+    # 建立 tool_use_id → (工具名, input) 映射，用于给 tool_result 找到来源工具
+    tool_use_info: dict = {}
+    for msg in messages:
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if isinstance(content, list):
+            for b in content:
+                if isinstance(b, dict) and b.get("type") == "tool_use":
+                    tool_use_info[b.get("id")] = (b.get("name", ""), b.get("input", {}) or {})
+
+    end = len(messages) - keep_recent if keep_recent > 0 else len(messages)
+    result = list(messages)
+    changed = False
+    for i in range(end):
+        msg = result[i]
+        if not isinstance(msg, dict) or msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        new_blocks = None
+        for j, block in enumerate(content):
+            if not (isinstance(block, dict) and block.get("type") == "tool_result"):
+                continue
+            raw = block.get("content", "")
+            raw_str = raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False)
+            if len(raw_str) < STUB_MIN_CHARS:
+                continue
+            name, inp = tool_use_info.get(block.get("tool_use_id"), ("", {}))
+            if name and name not in LARGE_CONTENT_TOOLS:
+                continue
+            path = inp.get("file_path") or inp.get("pdf_path") or inp.get("tex_path") or ""
+            loc = f"文件 {path} " if path else ""
+            pointer = (f"[{name or '工具'} 结果已省略 — {loc}共 {len(raw_str)} 字符；"
+                       f"需要时重新调用 {name or '相应工具'}]")
+            if new_blocks is None:
+                new_blocks = list(content)
+            new_blocks[j] = {**block, "content": pointer}
+        if new_blocks is not None:
+            result[i] = {**msg, "content": new_blocks}
+            changed = True
+    return result if changed else messages
+
+
+def is_context_overflow_error(e: Exception) -> bool:
+    """判断异常是否为 API 上下文超限（prompt_too_long 类错误）"""
+    text = f"{type(e).__name__}: {e}".lower()
+    return any(p in text for p in CONTEXT_OVERFLOW_PATTERNS)
+
+
+def reactive_compact(messages: list[dict], llm, agent_name: str,
+                     keep_recent: int = 5) -> list:
+    """紧急压缩：API 返回上下文超限后调用，压缩后由调用方重试一次。
+
+    两层递进：
+      1. 全库路径指针替换（含 recent 段——超限主因通常就是大 tool_result，
+         且只改 content 不破坏 tool_use/tool_result 配对）
+      2. 在指针化结果上做安全切分 + aggressive LLM 摘要（保留最近 keep_recent 条）
+    若切分不可行（cut<=0），返回仅做指针化的结果（已显著减小）。
+    """
+    logger.warning(
+        f"[{agent_name}] reactive_compact: 上下文超限，紧急压缩 {len(messages)} 条消息",
+        extra={"event": "reactive_compact", "agent": agent_name, "old_count": len(messages)},
+    )
+    stubbed = _stub_large_tool_results(messages, keep_recent=0)
+    cut = _safe_cut(stubbed, keep_recent)
+    if cut <= 0:
+        return stubbed
+    old_text = serialize_for_compression(stubbed[:cut])
+    summary = summarize_for_compression(llm, old_text, agent_name=agent_name, mode="aggressive")
+    compressed = [
+        {"role": "user", "content": f"[紧急压缩摘要 — 因上下文超限触发]\n\n{summary}"}
+    ]
+    compressed.extend(stubbed[cut:])
+    logger.warning(
+        f"[{agent_name}] reactive_compact 完成: {len(messages)} → {len(compressed)} 条",
+        extra={"event": "reactive_compact", "agent": agent_name, "new_count": len(compressed)},
+    )
+    return compressed
+
+
+def _safe_cut(messages: list[dict], keep_recent: int) -> int:
+    """计算安全切点：向前回退，避免 recent 段以孤立的 tool_result 开头。
+
+    消息结构中 assistant(tool_use) 与 user(tool_result) 成对相邻。
+    若切出的 recent 段以 tool_result 消息开头（其配对的 assistant tool_use
+    被切进摘要区），API 会因孤立 tool_result 拒绝请求。
+    向前回退把配对的 assistant(tool_use) 一并划入 recent 段。
+    返回 0 表示无法安全切分（整段都是配对区），调用方应跳过压缩。
+    """
+    cut = len(messages) - keep_recent
+    while 0 < cut < len(messages):
+        head = messages[cut]
+        content = head.get("content") if isinstance(head, dict) else None
+        if isinstance(content, list) and any(
+            isinstance(b, dict) and b.get("type") == "tool_result" for b in content
+        ):
+            cut -= 1
+        else:
+            break
+    return max(cut, 0)
+
+
 def compress_messages(messages: list[dict], keep_recent: int, context_window: int,
                       llm, agent_name: str,
                       anchor_input_tokens: int | None = None,
@@ -284,8 +409,27 @@ def compress_messages(messages: list[dict], keep_recent: int, context_window: in
     if estimated < structured_threshold:
         return messages
 
-    old_messages = messages[:-keep_recent]
-    recent_messages = messages[-keep_recent:]
+    # ---- 第一层：廉价确定性减负 —— 旧段大 tool_result → 文件路径指针 ----
+    # 替换后重新本地估算（anchor 是替换前的真实值，已失效）；降到阈值以下即可免掉 LLM 摘要
+    stubbed = _stub_large_tool_results(messages, keep_recent)
+    if stubbed is not messages:
+        estimated = estimate_tokens(stubbed)
+        estimate_source = "local+stub"
+        messages = stubbed
+        if estimated < structured_threshold:
+            logger.info(
+                f"[{agent_name}] 路径指针替换后免压缩: estimated={estimated} tokens "
+                f"< threshold={structured_threshold}（{estimate_source}）",
+                extra={"event": "stub_compact", "agent": agent_name, "tokens": estimated},
+            )
+            return messages
+
+    # ---- 安全切点：回退避开孤立 tool_result（配对保护） ----
+    cut = _safe_cut(messages, keep_recent)
+    if cut <= 0:
+        return messages
+    old_messages = messages[:cut]
+    recent_messages = messages[cut:]
 
     old_text = serialize_for_compression(old_messages)
 

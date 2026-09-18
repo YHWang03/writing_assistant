@@ -20,7 +20,7 @@ from ..tools.registry import ToolRegistry
 from ..tools.builtin import (
     ParsePDFTool, GetPaperTextTool, SearchPapersTool, VerifyPaperTool,
     GenerateBibtexTool, SummarizePaperTool, WriteBibFileTool, WriteFileTool,
-    ReadFileTool, ListFilesTool, AddReferenceTool, ReadContextTool, MemoryTool,
+    ReadFileTool, ListFilesTool, AddReferenceTool, ReadContextTool,
     GenerateBibFromRefLibTool, FinishTool, ParseAndStoreTool,
     ListPaperFilesTool, FindRelevantPapersTool, WriteLibraryTool,
 )
@@ -60,7 +60,6 @@ class LiteratureAgent(Agent):
         self.tool_registry.register(AddReferenceTool())
         self._read_context = ReadContextTool()
         self.tool_registry.register(self._read_context)
-        self.tool_registry.register(MemoryTool())
         self.tool_registry.register(GenerateBibFromRefLibTool())
         self.tool_registry.register(ListPaperFilesTool())
         self.tool_registry.register(FindRelevantPapersTool())
@@ -69,20 +68,12 @@ class LiteratureAgent(Agent):
 
     def _sync_context_to_tools(self):
         """将 context.add_reference 注入到 AddReferenceTool，
-        将 reference_library 注入到 GenerateBibFromRefLibTool，
-        并将 memory_manager 注入到 MemoryTool"""
+        将 reference_library 注入到 GenerateBibFromRefLibTool"""
         # 每个任务开始重置搜索计数，防止跨 dispatch 累积（配合 search_papers 硬上限）
         try:
             search_tool = self.tool_registry.get_tool("search_papers")
             if search_tool is not None and hasattr(search_tool, "reset"):
                 search_tool.reset()
-        except Exception:
-            pass
-
-        try:
-            mem_tool = self.tool_registry.get_tool("memory")
-            if mem_tool is not None and self.memory_manager is not None:
-                mem_tool.set_memory_manager(self.memory_manager)
         except Exception:
             pass
 

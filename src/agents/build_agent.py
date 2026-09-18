@@ -2,7 +2,7 @@
 BuildAgent — 构建 Agent
 
 负责：
-- 搜索/验证/下载 LaTeX 模板
+- 验证 LaTeX 模板（用户提供的 template_dir，或内置默认模板）
 - 编译 .tex 文件生成 PDF
 - 解析编译日志，定位错误
 """
@@ -13,8 +13,8 @@ from ..prompts import load_prompt
 from ..tools.registry import ToolRegistry
 from ..tools.builtin import (
     DeleteFileTool, ReadFileTool, WriteFileTool, ListFilesTool,
-    SearchTemplateTool, ValidateTemplateTool, DownloadTemplateTool,
-    CompileLatexTool, ParseLatexLogTool, ReadContextTool, MemoryTool,
+    ValidateTemplateTool,
+    CompileLatexTool, ParseLatexLogTool, ReadContextTool,
     FinishTool,
 )
 
@@ -39,26 +39,16 @@ class BuildAgent(Agent):
         write_file.set_agent_name("BuildAgent")
         self.tool_registry.register(write_file)
         self.tool_registry.register(ListFilesTool())
-        self.tool_registry.register(SearchTemplateTool())
         self.tool_registry.register(ValidateTemplateTool())
-        self.tool_registry.register(DownloadTemplateTool())
         self.tool_registry.register(CompileLatexTool())
         self.tool_registry.register(ParseLatexLogTool())
         self.tool_registry.register(DeleteFileTool())
         self._read_context = ReadContextTool()
         self.tool_registry.register(self._read_context)
-        self.tool_registry.register(MemoryTool())
         self.tool_registry.register(FinishTool())
 
     def _sync_context_to_tools(self):
-        """将 context 注入到 ReadContextTool，memory_manager 注入到 MemoryTool"""
-        try:
-            mem_tool = self.tool_registry.get_tool("memory")
-            if mem_tool is not None and self.memory_manager is not None:
-                mem_tool.set_memory_manager(self.memory_manager)
-        except Exception:
-            pass
-
+        """将 context 注入到 ReadContextTool"""
         if self.context is not None:
             try:
                 self._read_context.set_context(self.context)

@@ -8,10 +8,9 @@ from .bib import (
     WriteBibFileTool, AddReferenceTool, ListCiteKeysTool, GenerateBibFromRefLibTool,
 )
 from .tex import DeleteFileTool, ReadFileTool, WriteFileTool, ListFilesTool
-from .template import SearchTemplateTool, ValidateTemplateTool, DownloadTemplateTool
+from .template import ValidateTemplateTool
 from .compile import CompileLatexTool, ParseLatexLogTool
 from .dispatch import DispatchTaskTool
-from .memory_tool import MemoryTool
 from .context import ReadContextTool
 from .finish import FinishTool
 from .library import ListPaperFilesTool, FindRelevantPapersTool, WriteLibraryTool
@@ -24,10 +23,9 @@ __all__ = [
     "WriteBibFileTool", "AddReferenceTool",
     "ListCiteKeysTool", "GenerateBibFromRefLibTool",
     "ReadFileTool", "WriteFileTool", "ListFilesTool", "DeleteFileTool",
-    "SearchTemplateTool", "ValidateTemplateTool", "DownloadTemplateTool",
+    "ValidateTemplateTool",
     "CompileLatexTool", "ParseLatexLogTool",
     "DispatchTaskTool",
-    "MemoryTool",
     "ReadContextTool",
     "FinishTool",
     "ListPaperFilesTool", "FindRelevantPapersTool", "WriteLibraryTool",

@@ -1,26 +1,28 @@
 """
 Agent 基类 — 所有 Agent 的抽象父类
 
-提供共享的 ReAct 工具调用循环（_run_loop），
+提供共享的工具调用循环（react / plan_execute 两种运行范式，直接实现在本类），
 子类只需实现 run()，决定如何编排 LLM 调用。
 
 特性：
   - 多轮对话：_history 自动纳入 messages 上下文（含工具调用摘要）
-  - 记忆系统：MemoryManager 统一管理两种记忆，_run_loop 自动记录
+  - 记忆系统：MemoryManager 统一管理，_run_loop 自动记录
   - 上下文注入：AgentContextView 的字段自动注入到 system prompt
   - 工具调用：每个 Agent 拥有独立的 ToolRegistry
   - 上下文压缩：历史过长时自动压缩为结构化摘要，降低 LLM schema dropout 风险
 """
 
+import ast as _ast
 import json
 import logging
+import re as _re
 from pathlib import Path
 from abc import ABC, abstractmethod
 from .message import Message
-from .llm import LLM
-from .run_modes import resolve_run_mode
-from .context_compress import compress_history, compress_messages
+from .llm import LLM, get_tool_llm
+from .context_compress import compress_history, compress_messages, reactive_compact, is_context_overflow_error
 from .token_counter import estimate_tokens
+from ..memory import AgentMemory
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +41,12 @@ _OUTPUT_PATH_PARAM = {
 
 # 产出闸门最多注入「还没写出产出文件」提示的次数，超过则放行（防止死循环）
 MAX_OUTPUT_NUDGES = 3
+
+# plan_execute 单个步骤内部的 ReAct 步数上限：防止某一步反复无效操作
+PLAN_STEP_MAX_STEPS = 6
+
+# 计划步骤数量硬上限：超过则截断，防止 LLM 把任务越切越细（实际 3~5 步通常足够）
+MAX_PLAN_STEPS = 5
 
 
 class Agent(ABC):
@@ -59,15 +67,30 @@ class Agent(ABC):
         self.tool_registry = None  # 由外部注入 ToolRegistry 实例
         self.context = None        # AgentContextView，由外部注入
 
-        # ---- 运行范式：字符串配置解析为 RunMode 策略实例 ----
-        self.run_mode = resolve_run_mode(run_mode)  # RunMode 实例
+        # ---- 运行范式：react | plan_execute（未知值回退 react） ----
+        self.run_mode = run_mode if run_mode in ("react", "plan_execute") else "react"
+
+        # ---- 跨步骤产出路径收集：plan_execute 结束后闸门校验用（_run_loop 任务边界清空） ----
+        self._written_paths: set[str] = set()
 
         # ---- 上下文压缩 ----
         self.context_window = context_window  # LLM 上下文窗口大小（tokens）
         self.history_keep_recent = history_keep_recent  # 压缩时保留的最近消息数
 
-        # ---- 记忆系统 ----
-        self.memory_manager = None  # MemoryManager 实例，由外部注入
+        # ---- 记忆系统：AgentMemory 由外部注入；召回/提取由 hooks 在任务边界自动完成 ----
+        self.memory: AgentMemory | None = None
+        self._recalled_memory: str = ""  # 入口 hook 召回的记忆文本，_run_loop 注入 system prompt
+
+        # ---- 实例级 hooks：挂在循环上，不写进循环里（每个 Agent 实例独立注册表） ----
+        # 事件：user_prompt_submit（任务入口）/ pre_tool_use / post_tool_use / stop（任务出口，整体一次）
+        self._hooks: dict[str, list] = {
+            event: [] for event in
+            ("user_prompt_submit", "pre_tool_use", "post_tool_use", "stop")
+        }
+        # 默认 hooks：记忆召回（入口）、产出路径收集（工具后）、记忆提取（出口）
+        self.register_hook("user_prompt_submit", self._hook_memory_recall)
+        self.register_hook("post_tool_use", self._hook_collect_written_paths)
+        self.register_hook("stop", self._hook_memory_extract)
 
         # ---- 确定性产出闸门：完成前必须写出的产出文件后缀（如 [".bib"] / [".tex"]），空列表表示不设闸门 ----
         self.required_output_exts: list[str] = []
@@ -152,11 +175,70 @@ class Agent(ABC):
         except Exception:
             return ""
 
-    def _save_to_memory(self, user_input: str, result: str):
-        """将本轮交互保存到记忆系统（委托 MemoryManager）"""
-        if self.memory_manager:
-            self.memory_manager.record_interaction(
-                self.name, user_input, result)
+    # ---- Hooks：扩展点不侵入循环 ----
+
+    def register_hook(self, event: str, callback):
+        """注册 hook 回调到指定事件（实例级，子类可在 _setup 后追加自己的 hook）"""
+        if event not in self._hooks:
+            raise ValueError(f"未知 hook 事件: {event}（可用: {list(self._hooks)}）")
+        self._hooks[event].append(callback)
+
+    def _trigger_hooks(self, event: str, *args):
+        """按注册顺序触发该事件的所有 hook，返回第一个非 None 结果（pre_tool_use 拦截 / stop 强制继续用）"""
+        for callback in self._hooks[event]:
+            result = callback(*args)
+            if result is not None:
+                return result
+        return None
+
+    # ---- 默认 hooks ----
+
+    def _hook_memory_recall(self, user_input: str):
+        """user_prompt_submit：任务入口召回相关记忆，存入 _recalled_memory 供 _run_loop 注入 system prompt"""
+        self._recalled_memory = ""
+        if self.memory is None:
+            return None
+        try:
+            recalled = self.memory.recall(user_input, llm=get_tool_llm())
+            if recalled:
+                self._recalled_memory = recalled
+                logger.info(f"[{self.name}] 召回相关记忆 {len(recalled)} 字符",
+                            extra={"event": "memory_recall", "agent": self.name,
+                                   "chars": len(recalled)})
+        except Exception as e:
+            logger.warning(f"[{self.name}] 记忆召回失败: {e}")
+        return None
+
+    def _hook_collect_written_paths(self, block, output: str):
+        """post_tool_use：收集成功写出的产出文件路径（供产出闸门校验，plan_execute 跨步骤共享）"""
+        path_param = _OUTPUT_PATH_PARAM.get(block.name)
+        if path_param:
+            p = block.input.get(path_param)
+            ok = not output.startswith(("Error:", "警告:"))
+            if block.name in ("write_bib_file", "generate_bib_from_ref_library"):
+                ok = '"status": "ok"' in output
+            if ok and isinstance(p, str) and p:
+                try:
+                    self._written_paths.add(str(Path(p).resolve()))
+                except (OSError, ValueError):
+                    pass
+        return None
+
+    def _hook_memory_extract(self, user_input: str, result: str):
+        """stop：任务出口（每次 run() 整体一次）从对话中提取持久化知识入库，必要时触发整理"""
+        if self.memory is None:
+            return None
+        try:
+            lines = [f"{m.role}: {str(m.content)[:500]}" for m in self._history[-12:]]
+            lines.append(f"user: {str(user_input)[:500]}")
+            lines.append(f"assistant: {str(result)[:500]}")
+            dialogue = "\n".join(lines)[:8000]
+            stored = self.memory.extract(dialogue, llm=get_tool_llm())
+            if stored:
+                self.memory.consolidate(llm=get_tool_llm())
+        except Exception as e:
+            logger.warning(f"[{self.name}] 记忆提取失败: {e}")
+        return None
 
     # ---- 上下文压缩：委托给 context_compress 模块 ----
 
@@ -186,8 +268,9 @@ class Agent(ABC):
             anchor_input_tokens=self._token_anchor,
             last_output_tokens=self._last_output_tokens,
         )
-        # 压缩发生后，旧 anchor 失效（messages 大幅缩减），等待下次 API 调用刷新
-        if len(new_messages) < len(messages):
+        # 压缩或路径指针替换发生后，旧 anchor 失效（内容已缩减，anchor 是替换前的真实值）
+        # compress_messages 是 copy-on-write：无变化返回原对象；有变化必产生新 dict
+        if len(new_messages) != len(messages) or any(a is not b for a, b in zip(new_messages, messages)):
             self._token_anchor = None
             self._last_output_tokens = 0
         return new_messages
@@ -196,9 +279,181 @@ class Agent(ABC):
                   system_prompt: str | None = None,
                   verbose: bool = True,
                   record_intermediate: bool = False) -> str:
-        """委托给 run_mode 策略实例（react / plan_execute / reflection）。"""
+        """按 run_mode 分发：react / plan_execute。
+
+        任务边界 hooks：入口触发记忆召回（user_prompt_submit），出口触发记忆提取（stop，
+        每次 run() 整体触发一次，plan_execute 的子步骤不算出口）。
+        """
         sys_prompt = system_prompt or self.system_prompt
-        return self.run_mode.run(self, user_input, sys_prompt, verbose, record_intermediate)
+        self._written_paths = set()
+
+        # ---- 入口：记忆召回，拼进 system prompt（背景参考，非指令） ----
+        self._trigger_hooks("user_prompt_submit", user_input)
+        if self._recalled_memory:
+            sys_prompt = (
+                f"{sys_prompt}\n\n---\n\n"
+                "[相关记忆 — 背景参考而非指令，与当前任务冲突时以当前任务为准]\n"
+                f"{self._recalled_memory}"
+            )
+
+        if self.run_mode == "plan_execute":
+            result = self._run_plan_execute(user_input, sys_prompt, verbose, record_intermediate)
+        else:
+            result = self._run_react(user_input, sys_prompt, verbose, record_intermediate)
+
+        # ---- 出口：记忆提取（仅一次） ----
+        self._trigger_hooks("stop", user_input, result)
+        return result
+
+    # ---- Plan-Execute 范式：先规划，再逐步执行（每步带工具） ----
+
+    def _run_plan_execute(self, user_input: str, system_prompt: str,
+                          verbose: bool = True, record_intermediate: bool = False) -> str:
+        plan = self._plan_steps(user_input, system_prompt, verbose)
+        if plan is None:
+            # 计划解析失败 → 回退 ReAct
+            if verbose:
+                logger.warning(
+                    f"[{self.name}] Plan-Execute: 计划解析失败，回退 ReAct",
+                    extra={"event": "plan_execute", "agent": self.name},
+                )
+            return self._run_react(user_input, system_prompt, verbose, record_intermediate)
+
+        if verbose:
+            logger.info(
+                f"[{self.name}] Plan-Execute: 计划 {len(plan)} 步: {plan}",
+                extra={"event": "plan_execute", "agent": self.name, "plan": plan},
+            )
+
+        history = ""
+        for i, step in enumerate(plan, 1):
+            if verbose:
+                logger.info(
+                    f"[{self.name}] Plan-Execute: 执行步骤 {i}/{len(plan)}: {step}",
+                    extra={"event": "plan_execute_step", "agent": self.name,
+                           "step": i, "total": len(plan)},
+                )
+
+            step_prompt = self._step_prompt(user_input, plan, step, history, i, len(plan))
+            step_result = self._run_react(
+                step_prompt, system_prompt, verbose,
+                require_finish=False, max_react_steps=PLAN_STEP_MAX_STEPS,
+            )
+            history += f"步骤 {i}: {step}\n结果: {step_result}\n\n"
+
+        # ---- 产出闸门：所有步骤执行完后校验（_run_react 子步骤不校验，在此统一补上） ----
+        if self.required_output_exts and not self._output_satisfied(self._written_paths):
+            if verbose:
+                logger.info(
+                    f"[{self.name}] Plan-Execute 步骤全部完成但未产出必需文件"
+                    f"（需 {self.required_output_exts}），追加修正轮",
+                    extra={"event": "output_gate", "agent": self.name},
+                )
+            corrective = (
+                f"所有计划步骤已执行完，但还没有写出要求的产出文件"
+                f"（{', '.join(self.required_output_exts)}）。请立即用已有材料写出产出文件，"
+                "确认已写入且非空后调用 finish。"
+            )
+            self._run_react(corrective, system_prompt, verbose,
+                            record_intermediate, require_finish=True)
+
+        summary = self._plan_summarize(system_prompt, history)
+        self.add_message(Message(user_input, "user"))
+        self.add_message(Message(history, "user"))
+        self.add_message(Message(summary, "assistant"))
+        return summary
+
+    # ---- Planner：纯 LLM 出计划（无工具） ----
+
+    def _plan_steps(self, user_input: str, system_prompt: str, verbose) -> list | None:
+        plan_prompt = (
+            "你是一个顶级的AI规划专家。你的任务是将用户提出的复杂问题分解成"
+            "3 到 5 个粗粒度的行动计划步骤。\n\n"
+            "要求：\n"
+            "1. 步骤数量严格控制在 3~5 个，宁可合并同类操作，不要拆得过细。\n"
+            "2. 每个步骤是一个独立的、可执行的子任务，按逻辑顺序排列。\n"
+            "3. 「写产出文件」等最终动作合并到最后一步，不要为不同文件名重复拆步骤。\n"
+            "4. 最后一步通常是汇总/报告结果。\n\n"
+            "示例（文献处理场景）：\n"
+            '["解析相关 PDF 并入库", '
+            '"检查失败条目、补全缺失元数据", '
+            '"生成 BibTeX 写入产出文件并汇总结果"]\n\n'
+            "问题: {question}\n\n"
+            "请严格按照以下格式输出你的计划（一个 Python 列表）:\n"
+            "```python\n"
+            '["步骤1", "步骤2", "步骤3"]\n'
+            "```"
+        ).format(question=user_input)
+
+        try:
+            plan_result = self.llm.chat(
+                messages=[{"role": "user", "content": plan_prompt}],
+                system=system_prompt,
+                max_tokens=16384,
+            ).strip()
+        except Exception as e:
+            if verbose:
+                logger.warning(f"[{self.name}] Plan-Execute: 规划调用失败: {e}")
+            return None
+
+        try:
+            # 把 LLM 返回的自然语言+结构化数据混合文本，提取成 Python list，再校验长度
+            plan_str = plan_result
+            code_match = _re.search(r"```(?:python)?\s*(\[[\s\S]*?\])\s*```", plan_str)
+            if code_match:
+                plan_str = code_match.group(1)
+            else:
+                list_match = _re.search(r"\[[\s\S]*\]", plan_str)
+                if list_match:
+                    plan_str = list_match.group(0)
+            plan = _ast.literal_eval(plan_str)  # str->list
+            if not isinstance(plan, list) or not plan:
+                raise ValueError("Empty plan")
+            if len(plan) > MAX_PLAN_STEPS:  # 步数超过上限，则做截断
+                if verbose:
+                    logger.warning(
+                        f"[{self.name}] Plan-Execute: 计划 {len(plan)} 步超过上限"
+                        f" {MAX_PLAN_STEPS}，截断为前 {MAX_PLAN_STEPS} 步"
+                    )
+                plan = plan[:MAX_PLAN_STEPS]
+            return plan
+        except Exception:
+            if verbose:
+                logger.warning(
+                    f"[{self.name}] Plan-Execute: 无法解析计划，回退 ReAct\n"
+                    f"  原始输出: {plan_result[:200]}"
+                )
+            return None
+
+    # ---- Executor：单步提示词 ----
+
+    def _step_prompt(self, user_input, plan, step, history, i, total) -> str:
+        return (
+            "你正在按计划分步执行任务。请专注完成「当前步骤」，"
+            "需要时调用工具（如解析 PDF、写入文件等），"
+            "完成当前步骤后给出结果说明。\n\n"
+            f"# 原始任务:\n{user_input}\n\n"
+            f"# 完整计划:\n{plan}\n\n"
+            f"# 已完成的步骤与结果:\n{history if history else '（无，这是第一步）'}\n\n"
+            f"# 当前步骤（第 {i}/{total} 步）:\n{step}"
+        )
+
+    # ---- 总结 ----
+
+    def _plan_summarize(self, system_prompt: str, history: str) -> str:
+        summary_prompt = (
+            "你已完成所有计划步骤。请根据以下执行结果，生成任务完成总结"
+            "（纯文本，不要调用工具）：\n\n"
+            f"{history}"
+        )
+        try:
+            return self.llm.chat(
+                messages=[{"role": "user", "content": summary_prompt}],
+                system=system_prompt,
+                max_tokens=1024,
+            ).strip()
+        except Exception:
+            return "Plan-Execute 完成。"
 
     def _run_react(self, user_input: str,
                    system_prompt: str | None = None,
@@ -267,10 +522,10 @@ class Agent(ABC):
                 has_output_tools = False
         wrote_output = False
         deadline_nudged = False
-        written_paths: set[str] = set()  # 本轮成功写出的产出文件绝对路径（供 finish 前确定性校验）
         output_nudges = 0                # 产出闸门已注入「还没写产出」提示的次数（防死循环）
 
         step_limit = max_react_steps or self.max_steps
+        reactive_compacted = False  # 上下文超限补救只试一次，防止反复重试
         for step in range(step_limit):
             try:
                 # ---- 收尾提示：临近步数上限仍未产出文件时，强制转向「写产出」 ----
@@ -295,12 +550,23 @@ class Agent(ABC):
                 # ---- 压缩 messages（如果过大） ----
                 messages = self._compress_messages(messages)
 
-                response = self.llm.chat_with_tools(
-                    messages=messages,
-                    tools=tools,
-                    system=sys_prompt,
-                    max_tokens=self.max_tokens,
-                )
+                try:
+                    response = self.llm.chat_with_tools(
+                        messages=messages,
+                        tools=tools,
+                        system=sys_prompt,
+                        max_tokens=self.max_tokens,
+                    )
+                except Exception as e:
+                    # ---- reactive 补救：API 报上下文超限 → 紧急压缩后重试一次 ----
+                    if not reactive_compacted and is_context_overflow_error(e):
+                        reactive_compacted = True
+                        messages = reactive_compact(messages, self.llm, self.name)
+                        self._token_anchor = None
+                        self._last_output_tokens = 0
+                        step -= 1  # 重试本轮，不消耗步数
+                        continue
+                    raise
 
                 # ---- 记录当前上下文的 token 占用 ----
                 # 优先用 API 返回的真实 usage（100% 准确，与 DeepSeek harness 对齐），
@@ -348,18 +614,8 @@ class Agent(ABC):
 
                         output = self._execute_tool(block.name, block.input)
 
-                        # 记录成功写出的产出文件路径（供 finish 前确定性校验）
-                        path_param = _OUTPUT_PATH_PARAM.get(block.name)
-                        if path_param:
-                            p = block.input.get(path_param)
-                            ok = not output.startswith(("Error:", "警告:"))
-                            if block.name in ("write_bib_file", "generate_bib_from_ref_library"):
-                                ok = '"status": "ok"' in output
-                            if ok and isinstance(p, str) and p:
-                                try:
-                                    written_paths.add(str(Path(p).resolve()))
-                                except (OSError, ValueError):
-                                    pass
+                        # PostToolUse hook：产出路径收集等副作用（注册表决定跑什么）
+                        self._trigger_hooks("post_tool_use", block, output)
 
                         if verbose:
                             safe = (
@@ -389,7 +645,7 @@ class Agent(ABC):
                 # ---- 处理 finish 请求：确定性产出闸门校验 ----
                 if finish_summary is not None:
                     if (require_finish
-                            and not self._output_satisfied(written_paths)
+                            and not self._output_satisfied(self._written_paths)
                             and output_nudges < MAX_OUTPUT_NUDGES):
                         output_nudges += 1
                         if verbose:
@@ -419,7 +675,6 @@ class Agent(ABC):
                             f"[本轮工具调用] {', '.join(tool_calls_made)}", "user",
                         ))
                     self.add_message(Message(finish_summary, "assistant"))
-                    self._save_to_memory(user_input, finish_summary)
                     return finish_summary
 
                 if tool_results:
@@ -464,7 +719,7 @@ class Agent(ABC):
                     # 连续无工具调用也要结束时，仍校验产出闸门：未产出必需文件再给一次机会
                     if (require_finish
                             and self.required_output_exts
-                            and not self._output_satisfied(written_paths)
+                            and not self._output_satisfied(self._written_paths)
                             and output_nudges < MAX_OUTPUT_NUDGES):
                         output_nudges += 1
                         nudge = (
@@ -500,8 +755,6 @@ class Agent(ABC):
                             f"[本轮工具调用] {', '.join(tool_calls_made)}", "system",
                         ))
                     self.add_message(Message(result, "assistant"))
-
-                    self._save_to_memory(user_input, result)
 
                     return result
 
@@ -547,7 +800,6 @@ class Agent(ABC):
             ))
         self.add_message(Message(summary, "assistant"))
 
-        self._save_to_memory(user_input, summary)
         return summary
 
     def __str__(self) -> str:

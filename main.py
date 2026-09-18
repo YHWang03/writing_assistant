@@ -22,7 +22,7 @@ from src.core.llm import LLM, configure_tool_llm
 from src.core.logging_setup import setup_structured_logging
 from src.core.paper_context import PaperContext
 from src.core.library import save_library
-from src.memory import MemoryManager
+from src.memory import AgentMemory
 from src.agents.master_agent import MasterAgent
 from src.agents.literature_agent import LiteratureAgent
 from src.agents.writing_agent import WritingAgent
@@ -77,9 +77,19 @@ def build_context(config: dict) -> PaperContext:
     seed_dir = _resolve(paths.get("seed_dir", "refs"))
     refs_dir = _resolve(paths.get("refs_dir", "reference"))
     library_dir = _resolve(paths.get("library_dir", "example/library"))
+
+    # 模板目录：用户提供的 template_dir 不存在或没有 .tex 时，回退到内置默认模板
+    template_dir = _resolve(paths.get("template_dir", "template"))
+    if not template_dir.exists() or not list(template_dir.glob("*.tex")):
+        default_template = _PROJECT_DIR / "resources" / "templates" / "default"
+        if default_template.exists():
+            logger.warning(
+                f"模板目录不可用（{template_dir}），回退到内置默认模板: {default_template}")
+            template_dir = default_template
+
     return PaperContext(
         output_dir=str(_resolve(paths.get("output_dir", "output"))),
-        template_dir=str(_resolve(paths.get("template_dir", "template"))),
+        template_dir=str(template_dir),
         library_dir=str(library_dir),
         seed_pdf_paths=[str(p) for p in seed_dir.glob("*.pdf")] if seed_dir.exists() else [],
         ref_pdf_paths=[str(p) for p in refs_dir.glob("*.pdf")] if refs_dir.exists() else [],
@@ -91,18 +101,19 @@ def build_context(config: dict) -> PaperContext:
     )
 
 
-def _build_agent_memory(agent_name: str, config: dict) -> MemoryManager:
-    """为单个 Agent 构建 MemoryManager"""
+def _build_agent_memory(agent_name: str, config: dict) -> AgentMemory:
+    """为单个 Agent 构建长期记忆（memory/{agent_name}.json，每 Agent 独立存储）"""
     mem_cfg = config.get("memory", {})
-    long_term_path = mem_cfg.get("long_term_path", f"memory/{agent_name}_long_term.json")
+    mem_path = mem_cfg.get("path", "memory/{agent_name}.json").format(agent_name=agent_name)
     # 相对路径基于项目根目录
-    lt_path = Path(long_term_path)
-    if not lt_path.is_absolute():
-        lt_path = _PROJECT_DIR / lt_path
-    return MemoryManager(
-        long_term_max_size=mem_cfg.get("long_term_max_size", 500),
-        episodic_max_size=mem_cfg.get("episodic_max_size", 200),
-        long_term_path=str(lt_path),
+    p = Path(mem_path)
+    if not p.is_absolute():
+        p = _PROJECT_DIR / p
+    return AgentMemory(
+        path=str(p),
+        max_records=mem_cfg.get("max_records", 200),
+        recall_limit=mem_cfg.get("recall_limit", 5),
+        consolidate_threshold=mem_cfg.get("consolidate_threshold", 10),
     )
 
 
@@ -130,7 +141,7 @@ def build_agents(config: dict, llm: LLM) -> dict[str, object]:
         max_tokens=agent_cfg.get("master", {}).get("max_tokens", 4096),
         run_mode=_get_run_mode("MasterAgent"),
     )
-    master.memory_manager = _build_agent_memory("master", config)
+    master.memory = _build_agent_memory("master", config)
 
     # --- LiteratureAgent ---
     literature = LiteratureAgent(
@@ -140,7 +151,7 @@ def build_agents(config: dict, llm: LLM) -> dict[str, object]:
         run_mode=_get_run_mode("LiteratureAgent"),
         min_relevant=agent_cfg.get("literature", {}).get("min_relevant", 15),
     )
-    literature.memory_manager = _build_agent_memory("literature", config)
+    literature.memory = _build_agent_memory("literature", config)
 
     # --- WritingAgent ---
     writing = WritingAgent(
@@ -149,7 +160,7 @@ def build_agents(config: dict, llm: LLM) -> dict[str, object]:
         max_tokens=agent_cfg.get("writing", {}).get("max_tokens", 8192),
         run_mode=_get_run_mode("WritingAgent"),
     )
-    writing.memory_manager = _build_agent_memory("writing", config)
+    writing.memory = _build_agent_memory("writing", config)
 
     # --- CitationAgent ---
     citation = CitationAgent(
@@ -158,7 +169,7 @@ def build_agents(config: dict, llm: LLM) -> dict[str, object]:
         max_tokens=agent_cfg.get("citation", {}).get("max_tokens", 4096),
         run_mode=_get_run_mode("CitationAgent"),
     )
-    citation.memory_manager = _build_agent_memory("citation", config)
+    citation.memory = _build_agent_memory("citation", config)
 
     # --- ReviewAgent ---
     review = ReviewAgent(
@@ -167,7 +178,7 @@ def build_agents(config: dict, llm: LLM) -> dict[str, object]:
         max_tokens=agent_cfg.get("review", {}).get("max_tokens", 4096),
         run_mode=_get_run_mode("ReviewAgent"),
     )
-    review.memory_manager = _build_agent_memory("review", config)
+    review.memory = _build_agent_memory("review", config)
 
     # --- BuildAgent ---
     build = BuildAgent(
@@ -176,7 +187,7 @@ def build_agents(config: dict, llm: LLM) -> dict[str, object]:
         max_tokens=agent_cfg.get("build", {}).get("max_tokens", 4096),
         run_mode=_get_run_mode("BuildAgent"),
     )
-    build.memory_manager = _build_agent_memory("build", config)
+    build.memory = _build_agent_memory("build", config)
 
     # 注册子 Agent 到主 Agent
     master.register_sub_agent("LiteratureAgent", literature)
@@ -325,8 +336,8 @@ def main():
 
     # 退出前保存长期记忆
     for agent_name, agent in agents.items():
-        if agent.memory_manager:
-            agent.memory_manager.save()
+        if agent.memory:
+            agent.memory.save()
             logger.info(f"已保存 {agent_name} 长期记忆")
 
 

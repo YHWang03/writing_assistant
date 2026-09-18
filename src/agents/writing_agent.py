@@ -12,7 +12,7 @@ from ..core.agent import Agent
 from ..core.llm import LLM
 from ..prompts import load_prompt
 from ..tools.registry import ToolRegistry
-from ..tools.builtin import ReadFileTool, WriteFileTool, ListFilesTool, ScanCitationsTool, LookupPaperInfoTool, ReadContextTool, MemoryTool, ListCiteKeysTool, FinishTool
+from ..tools.builtin import ReadFileTool, WriteFileTool, ListFilesTool, ScanCitationsTool, LookupPaperInfoTool, ReadContextTool, ListCiteKeysTool, FinishTool
 
 
 class WritingAgent(Agent):
@@ -45,20 +45,10 @@ class WritingAgent(Agent):
         self.tool_registry.register(self._read_context)
         self._list_cite_keys = ListCiteKeysTool()
         self.tool_registry.register(self._list_cite_keys)
-        self.tool_registry.register(MemoryTool())
         self.tool_registry.register(FinishTool())
 
     def _sync_context_to_tools(self):
-        """将 PaperContext 中的 reference_library 注入到 LookupPaperInfoTool，
-        并将 memory_manager 注入到 MemoryTool"""
-        # memory 注入不依赖 context，独立处理
-        try:
-            mem_tool = self.tool_registry.get_tool("memory")
-            if mem_tool is not None and self.memory_manager is not None:
-                mem_tool.set_memory_manager(self.memory_manager)
-        except Exception:
-            pass
-
+        """将 PaperContext 中的 reference_library 注入到 LookupPaperInfoTool"""
         if self.context is None:
             return
         try:

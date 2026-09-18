@@ -12,7 +12,7 @@ from ..core.agent import Agent
 from ..core.llm import LLM
 from ..prompts import load_prompt
 from ..tools.registry import ToolRegistry
-from ..tools.builtin import ReadFileTool, ListFilesTool, DispatchTaskTool, MemoryTool, ReadContextTool, FinishTool
+from ..tools.builtin import ReadFileTool, ListFilesTool, DispatchTaskTool, ReadContextTool, FinishTool
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +44,6 @@ class MasterAgent(Agent):
         self._read_context = ReadContextTool()
         self.tool_registry.register(self._read_context)
 
-        self.tool_registry.register(MemoryTool())
         self.tool_registry.register(FinishTool())
 
     def register_sub_agent(self, name: str, agent: Agent):
@@ -66,14 +65,7 @@ class MasterAgent(Agent):
             return f"Error: {agent_name} 执行失败 — {e}"
 
     def _sync_context_to_tools(self):
-        """将 context 注入到 ReadContextTool，memory_manager 注入到 MemoryTool"""
-        try:
-            mem_tool = self.tool_registry.get_tool("memory")
-            if mem_tool is not None and self.memory_manager is not None:
-                mem_tool.set_memory_manager(self.memory_manager)
-        except Exception:
-            pass
-
+        """将 context 注入到 ReadContextTool"""
         if self.context is not None:
             try:
                 self._read_context.set_context(self.context)

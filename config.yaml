@@ -24,7 +24,7 @@ llm:
 
 # === Agent 配置 ===
 agents:
-  # Agent 运行范式: react | plan_execute | reflection
+  # Agent 运行范式: react | plan_execute
   # 两种写法：
   #   1) 全局统一：run_mode: react
   #   2) 按 Agent 覆盖（default 为全局默认，未列出的 Agent 沿用 default）：
@@ -55,7 +55,9 @@ agents:
     max_tokens: 8192
 
 # === 记忆配置 ===
+# 每个 Agent 一份独立的长期记忆（JSON），由 harness 在任务边界自动召回/提取
 memory:
-  long_term_max_size: 500          # 长期记忆最大条数
-  episodic_max_size: 200           # 情景记忆最大条数
-  # 长期记忆文件按 Agent 自动命名：memory/{agent_name}_long_term.json
+  path: "memory/{agent_name}.json"   # 记忆文件路径模板（按 Agent 命名）
+  max_records: 200                   # 每个 Agent 记忆最大条数（超出淘汰最老记录）
+  recall_limit: 5                    # 每次任务入口召回的相关记忆条数上限
+  consolidate_threshold: 10          # 记录数达到该阈值后触发 LLM 合并整理
