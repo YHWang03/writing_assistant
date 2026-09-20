@@ -13,6 +13,8 @@ venv/
 # ===== 运行时产物 =====
 logs/
 memory/*.json
+.transcripts/
+.task_outputs/
 
 # ===== example/：仅上传空目录结构，具体文件一律不上传 =====
 /example/**
