@@ -1,20 +1,14 @@
-"""
-ReviewAgent — 评审 Agent
-
-负责：
-- 阅读论文草稿
-- 从多个维度评审（结构、逻辑、语言、引用、格式）
-- 生成结构化的评审报告（review_report.txt）
-
-注意：ReviewAgent 只负责评审和生成报告，不负责修改 TeX 文件。
-修改 TeX 的工作由 MasterAgent 分派给 WritingAgent 完成。
-"""
+"""ReviewAgent — 评审 Agent：阅读论文草稿，从多维度评审并生成结构化评审报告。"""
 
 from ..core.agent import Agent
 from ..core.llm import LLM
 from ..prompts import load_prompt
 from ..tools.registry import ToolRegistry
 from ..tools.builtin import ReadFileTool, WriteFileTool, ListFilesTool, ReadContextTool, FinishTool
+from ..hooks.builtin import (
+    MemoryRecallHook, DeadlineNudgeHook, CollectWrittenPathsHook,
+    FinishNudgeHook, OutputGateHook, MemoryExtractHook,
+)
 
 
 class ReviewAgent(Agent):
@@ -22,6 +16,15 @@ class ReviewAgent(Agent):
 
     def __init__(self, llm: LLM, max_steps: int = 20, max_tokens: int = 12288,
                  run_mode: str = "react"):
+        """初始化 ReviewAgent，加载系统提示词并注册工具集。
+
+        paras:
+        llm: LLM 实例
+        max_steps: 最大执行步数
+        max_tokens: 单次生成最大 token 数
+        run_mode: 运行模式（react/plan_execute）
+        return: 无
+        """
         super().__init__(
             name="ReviewAgent", llm=llm,
             system_prompt=load_prompt("review_agent.md"),
@@ -29,8 +32,14 @@ class ReviewAgent(Agent):
             run_mode=run_mode,
         )
         self._setup_tools()
+        self._setup_hooks()
 
     def _setup_tools(self):
+        """注册本 Agent 的工具集。
+
+        paras: 无
+        return: 无
+        """
         self.tool_registry = ToolRegistry()
         self.tool_registry.register(ReadFileTool())
         write_file = WriteFileTool()
@@ -41,8 +50,25 @@ class ReviewAgent(Agent):
         self.tool_registry.register(self._read_context)
         self.tool_registry.register(FinishTool())
 
+    def _setup_hooks(self):
+        """注册本 Agent 的 hooks。
+
+        paras: 无
+        return: 无
+        """
+        self.hooks.register(MemoryRecallHook())
+        self.hooks.register(DeadlineNudgeHook())
+        self.hooks.register(CollectWrittenPathsHook())
+        self.hooks.register(FinishNudgeHook())
+        self.hooks.register(OutputGateHook())
+        self.hooks.register(MemoryExtractHook())
+
     def _sync_context_to_tools(self):
-        """将 context 注入到 ReadContextTool"""
+        """将 context 注入到 ReadContextTool。
+
+        paras: 无
+        return: 无
+        """
         if self.context is not None:
             try:
                 self._read_context.set_context(self.context)
@@ -50,4 +76,10 @@ class ReviewAgent(Agent):
                 pass
 
     def run(self, input_text: str) -> str:
+        """运行 ReviewAgent 执行循环。
+
+        paras:
+        input_text: 任务输入文本
+        return: 执行结果文本
+        """
         return self._run_loop(input_text, verbose=True)

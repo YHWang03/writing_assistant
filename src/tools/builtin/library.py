@@ -1,8 +1,4 @@
-"""文献库工具（library-first 流程）
-- ListPaperFilesTool      : 列出 seed/refs 目录的 PDF，从文件名解析 year + title_query
-- FindRelevantPapersTool  : 从持久文献库检索与主题相关的文献，并加入 reference_library
-- WriteLibraryTool        : 把 reference_library 合并写回持久文献库 JSON
-"""
+"""文献库工具 — 列出 PDF、从持久库检索相关文献、写回持久库。"""
 
 import json as json_mod
 import re
@@ -14,16 +10,15 @@ from ...core.library import load_library, save_library
 from ...core.llm import get_tool_llm
 
 
-# ---- 文件名解析 ----
-
 _UNICODE_HYPHENS = ("‐", "‑", "–", "—", "‒", "―")
 
 
 def parse_paper_filename(filename: str) -> dict:
-    """从论文 PDF 文件名解析出可靠的元数据。
+    """从论文 PDF 文件名解析元数据（年份 + 标题候选串）。
 
-    只提取可靠信息：开头 4 位年份 + 其余部分（_/- → 空格）作为标题候选串。
-    作者边界（单作者/双作者）不可靠，不在此处切分，交给联网检索解析。
+    paras:
+        filename: PDF 文件名
+    return: {"year": int, "title_query": str}；作者边界不可靠，不在此切分，交给联网检索解析
     """
     stem = Path(filename).stem
     for ch in _UNICODE_HYPHENS:
@@ -39,7 +34,7 @@ def parse_paper_filename(filename: str) -> dict:
 
 
 class ListPaperFilesTool(Tool):
-    """列出所有论文 PDF，并从文件名解析 year + title_query（不做 PDF 解析）。"""
+    """列出论文 PDF 并从文件名解析 year + title_query（不解析 PDF 内容）"""
 
     def __init__(self):
         super().__init__(
@@ -51,12 +46,26 @@ class ListPaperFilesTool(Tool):
         self._pdf_paths: list[str] = []
 
     def set_pdf_paths(self, seed_paths, ref_paths):
+        """注入 PDF 路径列表。
+
+        paras:
+            seed_paths: seed 目录 PDF 路径列表
+            ref_paths: reference 目录 PDF 路径列表
+        """
         self._pdf_paths = list(seed_paths or []) + list(ref_paths or [])
 
     def get_parameters(self) -> dict:
+        """返回工具参数的 JSON Schema 定义。
+
+        return: input_schema 字典
+        """
         return {"type": "object", "properties": {}, "required": []}
 
     def execute(self) -> str:
+        """列出所有论文 PDF 及解析出的元数据。
+
+        return: JSON 字符串 {"total", "papers": [{path, year, title_query}]}；未注入路径返回提示 JSON
+        """
         if not self._pdf_paths:
             return json_mod.dumps({
                 "total": 0, "papers": [],
@@ -73,11 +82,7 @@ class ListPaperFilesTool(Tool):
 
 
 class FindRelevantPapersTool(Tool):
-    """
-    从持久文献库检索与主题相关的文献，并自动加入 reference_library
-    输入参数topic及library_path, 提取所有文献的title,keywords,abstract(截断)字段
-    交由llm判断相关性，对相关文献进行入库
-    """
+    """从持久文献库检索与主题相关的文献并自动加入 reference_library"""
 
     def __init__(self):
         super().__init__(
@@ -91,15 +96,34 @@ class FindRelevantPapersTool(Tool):
         self._min_relevant = 15
 
     def set_library_path(self, path: str):
+        """注入持久文献库路径。
+
+        paras:
+            path: 文献库 JSON 文件路径
+        """
         self._library_path = path
 
     def set_add_func(self, add_func):
+        """注入入库回调（context.add_reference）。
+
+        paras:
+            add_func: 接收 Paper 对象的可调用对象
+        """
         self._add_func = add_func
 
     def set_min_relevant(self, n: int):
+        """设置默认最少相关文献数。
+
+        paras:
+            n: 最少相关文献数
+        """
         self._min_relevant = int(n)
 
     def get_parameters(self) -> dict:
+        """返回工具参数的 JSON Schema 定义。
+
+        return: input_schema 字典
+        """
         return {
             "type": "object",
             "properties": {
@@ -117,6 +141,13 @@ class FindRelevantPapersTool(Tool):
         }
 
     def execute(self, topic: str, min_relevant: int | None = None) -> str:
+        """检索与主题相关的文献并入库。
+
+        paras:
+            topic: 论文主题/创新点描述
+            min_relevant: 最少相关文献数，缺省用注入值
+        return: JSON 字符串，含 found/sufficient/min_relevant/total_in_library/papers
+        """
         if self._add_func is None:
             return json_mod.dumps({"error": "find_relevant_papers 未注入 add_reference"})
         threshold = int(min_relevant or self._min_relevant)
@@ -143,10 +174,14 @@ class FindRelevantPapersTool(Tool):
             ],
         }, ensure_ascii=False)
 
-    # ---- 相关性匹配 ----
-
     def _match_relevant(self, topic: str, candidates: list[Paper]) -> list[Paper]:
-        """用 flash LLM 做主题相关性筛选；失败则降级为关键词重叠。"""
+        """用 LLM 做主题相关性筛选，失败降级为关键词重叠。
+
+        paras:
+            topic: 论文主题
+            candidates: 候选 Paper 列表
+        return: 相关 Paper 列表
+        """
         lines = []
         for i, p in enumerate(candidates):
             abstract = (p.abstract or "").replace("\n", " ")[:400]
@@ -173,8 +208,13 @@ class FindRelevantPapersTool(Tool):
 
     @staticmethod
     def _parse_index_list(raw: str) -> list[int]:
-        # 防止llm返回结果包含其余无关信息
-        # 仅保留方括号中的内容，如 [0,3,7]
+        """解析 LLM 返回的序号数组文本。
+
+        paras:
+            raw: LLM 返回文本
+        return: 序号列表（仅保留合法整数）
+        """
+        # 只保留方括号中的内容，防止 LLM 输出夹带其他文本
         m = re.search(r"\[[\s\S]*\]", raw)
         if m:
             raw = m.group(0)
@@ -191,7 +231,13 @@ class FindRelevantPapersTool(Tool):
 
     @staticmethod
     def _keyword_match(topic: str, candidates: list[Paper]) -> list[Paper]:
-        """降级：主题与标题/摘要/关键词的 token 重叠评分。"""
+        """降级方案：按主题与标题/摘要/关键词的 token 重叠评分排序。
+
+        paras:
+            topic: 论文主题
+            candidates: 候选 Paper 列表
+        return: 按重叠度降序的 Paper 列表
+        """
         topic_tokens = set(re.findall(r"[a-zA-Z0-9]+", topic.lower()))
         scored: list[tuple[int, Paper]] = []
         for p in candidates:
@@ -205,7 +251,7 @@ class FindRelevantPapersTool(Tool):
 
 
 class WriteLibraryTool(Tool):
-    """把 reference_library 合并写回持久文献库 JSON。"""
+    """把 reference_library 合并写回持久文献库 JSON"""
 
     def __init__(self):
         super().__init__(
@@ -217,15 +263,33 @@ class WriteLibraryTool(Tool):
         self._reference_library: list[Paper] = []
 
     def set_library_path(self, path: str):
+        """注入持久文献库路径。
+
+        paras:
+            path: 文献库 JSON 文件路径
+        """
         self._library_path = path
 
     def set_reference_library(self, refs: list[Paper]):
+        """注入文献库列表。
+
+        paras:
+            refs: Paper 对象列表
+        """
         self._reference_library = refs
 
     def get_parameters(self) -> dict:
+        """返回工具参数的 JSON Schema 定义。
+
+        return: input_schema 字典
+        """
         return {"type": "object", "properties": {}, "required": []}
 
     def execute(self) -> str:
+        """把 reference_library 合并写回持久文献库 JSON。
+
+        return: JSON 字符串，含 total/added 统计；未注入路径返回 {"error": ...}
+        """
         if not self._library_path:
             return json_mod.dumps({"error": "write_library 未注入文献库路径"})
         before_keys = {p.cite_key for p in load_library(self._library_path) if p.cite_key}

@@ -1,9 +1,4 @@
-"""文件读写工具
-- ReadFileTool: 读取文件文本
-- WriteFileTool: 写入文本文件
-- ListFilesTool: 列出目录内容
-- DeleteFileTool: 按 glob 模式删除文件（如清理 LaTeX 辅助文件）
-"""
+"""文件读写工具 — 文本读取/写入/列目录/删除，带进程级缓存与路径沙箱。"""
 
 import glob as _glob
 from ..base import Tool
@@ -12,10 +7,10 @@ from ._safe_path import safe_resolve, _PROJECT_ROOT
 # 进程级文件内容缓存，避免同一文件被多个 Agent 重复读取
 _file_cache: dict[str, str] = {}
 
-# .tex 论文单次写入上限（字符）：超过则拒绝一次性覆盖，强制分段（先 write 再 append）
+# .tex 单次覆盖写入上限（字符），超过则拒绝并强制分段（先 write 再 append）
 _MAX_TEX_WRITE_CHARS = 8000
 
-# 二进制/不可按 UTF-8 读取的文件后缀（read_file 只读文本，这些交给专职工具）
+# read_file 不读取的二进制文件后缀，交给专职工具处理
 _BINARY_SUFFIXES = {
     ".pdf", ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff",
     ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
@@ -24,7 +19,7 @@ _BINARY_SUFFIXES = {
 
 
 class ReadFileTool(Tool):
-    """读取文件文本"""
+    """读取文件文本，支持 head/tail 两种模式"""
 
     def __init__(self):
         super().__init__(
@@ -35,10 +30,18 @@ class ReadFileTool(Tool):
         self._agent_name: str = ""
 
     def set_agent_name(self, name: str):
-        """设置调用此工具的 Agent 名称，用于拦截 .bib 读取"""
+        """设置调用此工具的 Agent 名称，用于拦截 .bib 读写。
+
+        paras:
+            name: Agent 名称
+        """
         self._agent_name = name
 
     def get_parameters(self) -> dict:
+        """返回工具参数的 JSON Schema 定义。
+
+        return: input_schema 字典
+        """
         return {
             "type": "object",
             "properties": {
@@ -61,12 +64,21 @@ class ReadFileTool(Tool):
 
     def execute(self, file_path: str, max_chars: int = 50000, offset: int = 0,
                 mode: str = "head") -> str:
+        """读取文件文本内容。
+
+        paras:
+            file_path: 文件路径
+            max_chars: 最大返回字符数
+            offset: 起始偏移（仅 head 模式生效）
+            mode: head 从开头/offset 读取，tail 从末尾向前读取
+        return: 文件文本；WritingAgent 读 .bib 时附带提示但不拦截；
+                二进制/非 UTF-8 文件返回指路提示，其他失败返回 "Error: ..." 字符串
+        """
         try:
             path = safe_resolve(file_path)
         except ValueError as e:
             return f"Error: {e}"
 
-        # soft warning：提示但仍允许读取 .bib 文件
         warning = ""
         if path.suffix == ".bib" and self._agent_name == "WritingAgent":
             warning = (
@@ -78,7 +90,6 @@ class ReadFileTool(Tool):
         if path.is_dir():
             return f"Error: '{file_path}' 是一个目录，请指定具体文件路径"
 
-        # 二进制文件不能按文本读取，直接指路到专职工具，避免抛原始编码异常
         if path.suffix.lower() in _BINARY_SUFFIXES:
             if path.suffix.lower() == ".pdf":
                 return (
@@ -119,7 +130,7 @@ class ReadFileTool(Tool):
 
 
 class WriteFileTool(Tool):
-    """写入文本文件 — 支持三种模式: write(覆盖), append(追加), replace(局部替换)"""
+    """写入文本文件，支持 write(覆盖)/append(追加)/replace(局部替换) 三种模式"""
 
     def __init__(self):
         super().__init__(
@@ -132,10 +143,18 @@ class WriteFileTool(Tool):
         self._agent_name: str = ""
 
     def set_agent_name(self, name: str):
-        """设置调用此工具的 Agent 名称，用于拦截非 LiteratureAgent 写 .bib"""
+        """设置调用此工具的 Agent 名称，用于拦截非 LiteratureAgent 写 .bib。
+
+        paras:
+            name: Agent 名称
+        """
         self._agent_name = name
 
     def get_parameters(self) -> dict:
+        """返回工具参数的 JSON Schema 定义。
+
+        return: input_schema 字典
+        """
         return {
             "type": "object",
             "properties": {
@@ -161,6 +180,16 @@ class WriteFileTool(Tool):
         }
 
     def execute(self, **kwargs) -> str:
+        """写入文本文件。
+
+        paras:
+            file_path: 文件路径
+            content: 要写入或替换的内容
+            mode: write 覆盖 / append 追加 / replace 局部替换
+            old_text: replace 模式要替换的原文（精确匹配一次）
+            append: 已弃用兼容参数，True 等价 mode="append"
+        return: 成功返回操作结果描述；参数缺失/路径越界/权限拦截返回 "Error: ..." 字符串
+        """
         file_path = kwargs.get("file_path")
         content = kwargs.get("content")
         mode = kwargs.get("mode", "write")
@@ -186,7 +215,6 @@ class WriteFileTool(Tool):
         except ValueError as e:
             return f"Error: {e}"
 
-        # 拦截非 LiteratureAgent 写 .bib 文件
         if path.suffix == ".bib" and self._agent_name != "LiteratureAgent":
             return (
                 "Error: 只有 LiteratureAgent 可以写入 .bib 文件。\n"
@@ -207,7 +235,7 @@ class WriteFileTool(Tool):
                     )
                 result = existing.replace(old_text, content, 1)
                 path.write_text(result, encoding="utf-8")
-                _file_cache.pop(str(path.resolve()), None)  # 写后清缓存
+                _file_cache.pop(str(path.resolve()), None)
                 return (
                     f"文件已替换: {file_path} ({len(result)} 字符, "
                     f"替换了 {len(old_text)} → {len(content)} 字符)"
@@ -218,12 +246,11 @@ class WriteFileTool(Tool):
                     existing = path.read_text(encoding="utf-8")
                     content = existing + content
                 path.write_text(content, encoding="utf-8")
-                _file_cache.pop(str(path.resolve()), None)  # 写后清缓存
+                _file_cache.pop(str(path.resolve()), None)
                 return f"文件已追加: {file_path} ({len(content)} 字符)"
 
             else:  # mode == "write"
-                # .tex 论文禁止一次性覆盖写入整篇：强制分段（先 write 再 append），
-                # 避免模型用单个超大 write_file 反复失败（内容超输出预算被截断后重试同一件事）
+                # 拒绝单次超大覆盖写 .tex：模型输出超预算被截断后会反复重试同一写入
                 if path.suffix == ".tex" and len(content) > _MAX_TEX_WRITE_CHARS:
                     return (
                         f"Error: 内容过大（{len(content)} 字符），拒绝一次性覆盖写入整篇 .tex。\n"
@@ -232,7 +259,7 @@ class WriteFileTool(Tool):
                         f"单次写入请控制在 {_MAX_TEX_WRITE_CHARS} 字符以内。"
                     )
                 path.write_text(content, encoding="utf-8")
-                _file_cache.pop(str(path.resolve()), None)  # 写后清缓存
+                _file_cache.pop(str(path.resolve()), None)
                 return f"文件已写入: {file_path} ({len(content)} 字符)"
 
         except Exception as e:
@@ -240,7 +267,7 @@ class WriteFileTool(Tool):
 
 
 class ListFilesTool(Tool):
-    """列出目录内容"""
+    """列出目录内容（含文件大小）"""
 
     def __init__(self):
         super().__init__(
@@ -250,6 +277,10 @@ class ListFilesTool(Tool):
         )
 
     def get_parameters(self) -> dict:
+        """返回工具参数的 JSON Schema 定义。
+
+        return: input_schema 字典
+        """
         return {
             "type": "object",
             "properties": {
@@ -262,6 +293,12 @@ class ListFilesTool(Tool):
         }
 
     def execute(self, dir_path: str = "") -> str:
+        """列出目录内容。
+
+        paras:
+            dir_path: 目录路径，缺省为项目根目录
+        return: 目录条目文本（[DIR]/[FILE] + 大小）；失败返回 "Error: ..." 字符串
+        """
         if not dir_path:
             dir_path = str(_PROJECT_ROOT)
         try:
@@ -296,7 +333,6 @@ class ListFilesTool(Tool):
             return f"Error: 列出目录失败 — {e}"
 
 
-# 默认 LaTeX 辅助文件 glob 模式
 _LATEX_AUX_PATTERNS = [
     "*.aux", "*.dvi", "*.log", "*.toc", "*.bbl", "*.blg",
     "*.out", "*.fff", "*.lof", "*~",
@@ -316,6 +352,10 @@ class DeleteFileTool(Tool):
         )
 
     def get_parameters(self) -> dict:
+        """返回工具参数的 JSON Schema 定义。
+
+        return: input_schema 字典
+        """
         return {
             "type": "object",
             "properties": {
@@ -334,6 +374,13 @@ class DeleteFileTool(Tool):
         }
 
     def execute(self, dir_path: str, patterns: list[str] | None = None) -> str:
+        """按 glob 模式删除文件。
+
+        paras:
+            dir_path: 目标目录
+            patterns: glob 模式列表，缺省删除 LaTeX 辅助文件
+        return: 删除结果描述文本（含失败明细）；无匹配返回提示字符串
+        """
         try:
             path = safe_resolve(dir_path)
         except ValueError as e:
@@ -353,13 +400,12 @@ class DeleteFileTool(Tool):
                     try:
                         f.unlink()
                         deleted.append(f.name)
-                        # 清除文件缓存（如果存在）
                         _file_cache.pop(str(f.resolve()), None)
                     except OSError as e:
                         errors.append(f"{f.name}: {e}")
 
         if not deleted and not errors:
-            return f"未找到匹配的文件（patterns: {patterns})"
+            return f"未找到匹配的文件（patterns: {patterns}）"
 
         result = f"已删除 {len(deleted)} 个文件:"
         for name in deleted:

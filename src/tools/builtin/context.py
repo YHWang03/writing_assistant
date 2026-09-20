@@ -1,6 +1,4 @@
-"""上下文工具 — Agent 主动读取 PaperContext 数据
-- ReadContextTool: 返回当前 Agent 可读的所有 PaperContext 字段
-"""
+"""上下文工具 — Agent 主动读取 PaperContext 数据。"""
 
 import json as json_mod
 
@@ -8,10 +6,7 @@ from ..base import Tool
 
 
 class ReadContextTool(Tool):
-    """
-    读取自己有权访问的 PaperContext 字段
-    可直接获取所有 context 字段的截断信息，或者定向获取指定字段的完整内容
-    """
+    """读取当前 Agent 有权访问的 PaperContext 字段"""
 
     def __init__(self):
         super().__init__(
@@ -19,12 +14,21 @@ class ReadContextTool(Tool):
             description="读取当前 Agent 可访问的上下文信息（论文路径、创新点、"
                         "实验描述、文献库、当前状态等）。可指定 field 参数读取单个字段的完整内容。"
         )
-        self._context_view = None  # 注入 AgentContextView
+        self._context_view = None
 
     def set_context(self, context_view):
+        """注入 AgentContextView。
+
+        paras:
+            context_view: AgentContextView 实例
+        """
         self._context_view = context_view
 
     def get_parameters(self) -> dict:
+        """返回工具参数的 JSON Schema 定义。
+
+        return: input_schema 字典
+        """
         return {
             "type": "object",
             "properties": {
@@ -42,13 +46,18 @@ class ReadContextTool(Tool):
         }
 
     def execute(self, field: str = "") -> str:
+        """读取上下文字段。
+
+        paras:
+            field: 要读取的字段名；为空返回所有可读字段的摘要
+        return: 字段内容文本；未注入/无权限/异常返回错误字符串
+        """
         if self._context_view is None:
             return "Error: 上下文未注入"
         try:
             if not field:
                 return self._context_view.get_readable_summary()
 
-            # 检查权限
             readable = getattr(self._context_view, "_readable", set())
             if field not in readable:
                 valid = sorted(readable)
@@ -58,14 +67,19 @@ class ReadContextTool(Tool):
                 ]
                 return "\n".join(lines)
 
-            # 返回完整内容
             value = getattr(self._context_view, field)
             return self._format_field_value(field, value)
         except Exception as e:
             return f"Error: 读取上下文失败 — {e}"
 
     def _format_field_value(self, field: str, value) -> str:
-        """格式化单个字段的完整内容"""
+        """格式化单个字段的完整内容。
+
+        paras:
+            field: 字段名
+            value: 字段值（任意类型）
+        return: 可读的文本表示
+        """
         if value is None:
             return f"{field}: (无数据)"
 
@@ -86,11 +100,9 @@ class ReadContextTool(Tool):
             if not value:
                 return f"{field}: (空列表)"
 
-            # reference_library 特殊处理：只展示 cite_key, title, authors, year, abstract
             if field == "reference_library":
                 return self._format_reference_library(value)
 
-            # 其他列表：直接展示
             lines = [f"{field}: [{len(value)} 个元素]"]
             for i, item in enumerate(value):
                 if isinstance(item, dict):
@@ -102,7 +114,12 @@ class ReadContextTool(Tool):
         return f"{field}: {value}"
 
     def _format_reference_library(self, refs: list) -> str:
-        """格式化 reference_library：完整展示每篇文献的所有字段"""
+        """格式化 reference_library，完整展示每篇文献的所有字段。
+
+        paras:
+            refs: 文献对象列表（含 to_dict 方法）
+        return: 文本表示
+        """
         lines = [f"reference_library: [{len(refs)} 篇文献]"]
         for i, ref in enumerate(refs):
             lines.append(f"--- 文献 {i+1} ---")

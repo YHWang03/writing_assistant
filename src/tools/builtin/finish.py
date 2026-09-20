@@ -1,14 +1,10 @@
-"""结束工具 — Agent 调用此工具表示任务完成，主动退出循环"""
+"""结束工具 — Agent 调用后主动退出 run_loop。"""
 
 from ..base import Tool
 
 
 class FinishTool(Tool):
-    """
-    Agent 调用 finish 表示任务已完成，loop 检测到此工具后直接退出
-    输入参数 summary, 返回 summary
-    此工具什么都不做，但是run_loop过程中识别到该工具调用后结束循环
-    """
+    """Agent 调用 finish 表示任务完成，loop 检测到此调用后直接退出"""
 
     def __init__(self):
         super().__init__(
@@ -18,6 +14,10 @@ class FinishTool(Tool):
         )
 
     def get_parameters(self) -> dict:
+        """返回工具参数的 JSON Schema 定义。
+
+        return: input_schema 字典
+        """
         return {
             "type": "object",
             "properties": {
@@ -30,5 +30,10 @@ class FinishTool(Tool):
         }
 
     def execute(self, summary: str = "") -> str:
-        # 实际不会被 _run_loop 调用，loop 在检测到 finish 时直接返回
+        """返回任务总结。
+
+        paras:
+            summary: 任务完成总结
+        return: summary 原文（loop 检测到 finish 即退出，一般不会真正执行到）
+        """
         return summary

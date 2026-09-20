@@ -1,9 +1,6 @@
-"""LaTeX 模板工具
-- ValidateTemplateTool: 验证模板目录可用性（存在可编译的主 .tex）
+"""LaTeX 模板工具 — 验证模板目录可用性（存在可编译的主 .tex）。
 
-模板来源：用户提供的 template_dir；未提供时使用内置默认模板
-（resources/templates/default/，由 main.py 在构建 PaperContext 时 fallback）。
-搜索/下载模板功能已移除（假实现，无实际功能）。
+模板来源为用户提供的 template_dir；未提供时由 main.py 回退到内置默认模板。
 """
 
 import json as json_mod
@@ -20,6 +17,10 @@ class ValidateTemplateTool(Tool):
         )
 
     def get_parameters(self) -> dict:
+        """返回工具参数的 JSON Schema 定义。
+
+        return: input_schema 字典
+        """
         return {
             "type": "object",
             "properties": {
@@ -29,6 +30,12 @@ class ValidateTemplateTool(Tool):
         }
 
     def execute(self, template_dir: str) -> str:
+        """验证模板目录存在且包含 .tex 文件。
+
+        paras:
+            template_dir: 模板目录路径
+        return: JSON 字符串 {"valid": bool, ...}，成功时含主 .tex/cls/sty 文件列表
+        """
         from pathlib import Path
         path = Path(template_dir)
         if not path.exists():

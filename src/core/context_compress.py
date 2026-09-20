@@ -1,34 +1,34 @@
-"""
-上下文压缩模块 — 将过长的对话历史压缩为结构化摘要。
+"""上下文压缩 — 按 s08 四步管线将过长对话压缩到上下文窗口内。
 
-供 Agent 类在 ReAct 循环中调用，避免上下文窗口溢出。
-支持渐进式两档压缩（structured 70% / aggressive 90%），
-LLM 压缩失败时自动 fallback 到规则型摘要。
+四步：
+  1. 路径指针（落盘占位）：旧段大 tool_result 替换为文件路径指针（确定性、零 LLM）
+  2. 安全切点：回退切点保护 tool_use/tool_result 配对
+  3. micro_compact：指针化后重新估算，已降到阈值以下则直接返回（免 LLM 摘要）
+  4. LLM 摘要兜底：structured（70% 阈值）/ aggressive（90% 阈值）两档，失败走规则摘要
+
+另含 reactive_compact：API 报上下文超限后的紧急压缩（全库指针化 + aggressive 摘要）。
 """
 
 import json
 import logging
-from collections import Counter
 import re
+from collections import Counter
+
 from .message import Message
-
-# 当有其它程序 import context_compress 时，在文件context_compress.py中, __name__的值为context_compress
-logger = logging.getLogger(__name__)
-
-# token 计数：使用 DeepSeek V4 官方 BPE 词表精确计数，不可用时自动回退到启发式
-# 实现见 src/core/token_counter.py（懒加载单例 + fallback）
 from .token_counter import estimate_tokens
 
-# 产生大内容输出的工具集合（压缩时只保留路径，不保留原始内容）
+logger = logging.getLogger(__name__)
+
+# 大内容工具集合：结果可由文件重新获得，压缩时只留路径指针
 LARGE_CONTENT_TOOLS = {
     "read_file", "parse_pdf", "get_paper_text", "read_context",
     "compile_latex", "parse_latex_log",
 }
 
-# 路径指针替换的最小结果长度：小于此值不值得替换（保留原样）
+# 路径指针替换的最小结果长度：小于此值不值得替换
 STUB_MIN_CHARS = 400
 
-# API 上下文超限错误的特征串（小写匹配，覆盖 Anthropic / OpenAI / DeepSeek 常见报错）
+# API 上下文超限错误特征串（小写匹配）
 CONTEXT_OVERFLOW_PATTERNS = (
     "prompt is too long", "prompt too long",
     "context_length_exceeded", "maximum context length",
@@ -37,25 +37,30 @@ CONTEXT_OVERFLOW_PATTERNS = (
 )
 
 
-def serialize_for_compression(messages: list) -> str:
-    """将消息列表序列化为结构化元数据，不保留大文件原始内容。
+def _get_content(msg) -> tuple:
+    """兼容 dict / Message 两种消息形态，取 (role, content)。
 
-    策略：
-    - 大内容工具（read_file, parse_pdf 等）：只保留文件路径 + 大小 + 首行摘要
-    - 写入工具：保留文件路径 + 模式 + 大小
-    - 搜索工具：保留查询 + 结果数量
-    - 其他工具：保留完整结果（通常较短）
-    - LLM 文本回复：保留前 300 字符
+    paras:
+        msg: dict 或 Message 对象
+    return: (role, content) 元组
+    """
+    if isinstance(msg, dict):
+        return msg.get("role", "unknown"), msg.get("content", "")
+    return msg.role, msg.content
+
+
+def serialize_for_compression(messages: list) -> str:
+    """把消息列表序列化为结构化元数据文本（供 LLM 摘要用）。
+
+    大内容工具只留路径，写入工具留路径+模式+大小，文本块截 300 字符。
+
+    paras:
+        messages: 消息列表（dict 或 Message 混合）
+    return: 逐行 "[role/类型]: 内容" 的文本
     """
     lines = []
     for msg in messages:
-        if isinstance(msg, dict):
-            role = msg.get("role", "unknown")
-            content = msg.get("content", "")
-        else:
-            role = msg.role
-            content = msg.content
-
+        role, content = _get_content(msg)
         if isinstance(content, str):
             lines.append(f"[{role}]: {content[:300]}")
         elif isinstance(content, list):
@@ -64,24 +69,9 @@ def serialize_for_compression(messages: list) -> str:
                     continue
                 t = block.get("type", "")
                 if t == "text":
-                    text = block.get("text", "") or ""
-                    lines.append(f"[{role}/text]: {text[:300]}")
+                    lines.append(f"[{role}/text]: {(block.get('text', '') or '')[:300]}")
                 elif t == "tool_use":
-                    name = block.get("name", "")
-                    inp = block.get("input", {})
-                    inp_str = json.dumps(inp, ensure_ascii=False)
-                    if name in LARGE_CONTENT_TOOLS:
-                        file_path = inp.get("file_path") or inp.get("pdf_path") or inp.get("tex_path") or ""
-                        lines.append(f"[{role}/tool_use]: {name}(path={file_path})")
-                    elif name == "write_file":
-                        fp = inp.get("file_path", "")
-                        md = inp.get("mode", "write")
-                        sz = len(inp.get("content", "") or "")
-                        lines.append(f"[{role}/tool_use]: write_file(path={fp}, mode={md}, content_size={sz})")
-                    elif name in ("search_papers", "verify_paper"):
-                        lines.append(f"[{role}/tool_use]: {name}({inp_str[:200]})")
-                    else:
-                        lines.append(f"[{role}/tool_use]: {name}({inp_str[:300]})")
+                    lines.append(f"[{role}/tool_use]: {_serialize_tool_use(block)}")
                 elif t == "tool_result":
                     raw = str(block.get("content", ""))
                     lines.append(f"[{role}/tool_result]: {summarize_tool_result(raw)}")
@@ -90,48 +80,64 @@ def serialize_for_compression(messages: list) -> str:
     return "\n".join(lines)
 
 
-def summarize_tool_result(raw: str) -> str:
-    """智能压缩工具结果：保留关键信息，丢弃大段原始内容。
+def _serialize_tool_use(block: dict) -> str:
+    """按工具类型序列化 tool_use block 的关键参数。
 
-    对 read_file 返回：保留文件路径 + 总大小
-    对 parse_pdf 返回：保留标题 + 作者 + 状态
-    对 write_file 返回：保留完整结果（通常很短）
-    对其他：保留前 200 字符
+    paras:
+        block: tool_use block dict
+    return: 如 "read_file(path=xxx)" 的短描述
+    """
+    name = block.get("name", "")
+    inp = block.get("input", {}) or {}
+    inp_str = json.dumps(inp, ensure_ascii=False)
+    if name in LARGE_CONTENT_TOOLS:
+        path = inp.get("file_path") or inp.get("pdf_path") or inp.get("tex_path") or ""
+        return f"{name}(path={path})"
+    if name == "write_file":
+        return (f"write_file(path={inp.get('file_path', '')}, "
+                f"mode={inp.get('mode', 'write')}, content_size={len(inp.get('content', '') or '')})")
+    if name in ("search_papers", "verify_paper"):
+        return f"{name}({inp_str[:200]})"
+    return f"{name}({inp_str[:300]})"
+
+
+def summarize_tool_result(raw: str) -> str:
+    """压缩单条工具结果文本：保留关键信息，丢弃大段原始内容。
+
+    paras:
+        raw: 工具原始输出
+    return: 截取后的短摘要（通常 <= 200 字符）
     """
     if not raw:
         return "(empty)"
     if raw.startswith("Error:"):
         return raw[:200]
-    if "文件已写入" in raw or "文件已追加" in raw or "文件已替换" in raw:
-        return raw[:150]
-    if "文件已删除" in raw or "已删除" in raw:
+    if "已写入" in raw or "已追加" in raw or "已替换" in raw or "已删除" in raw:
         return raw[:150]
     if "total" in raw and "chars" in raw and "truncated" in raw:
-        lines = raw.split("\n")
         first = ""
-        for line in lines:
-            if line.strip() and not line.startswith("提示："):
-                first = line.strip()[:200]
-                break
         total_info = ""
-        for line in lines:
+        for line in raw.split("\n"):
+            stripped = line.strip()
+            if not first and stripped and not line.startswith("提示："):
+                first = stripped[:200]
             if "total" in line and "chars" in line:
-                total_info = " " + line.strip()
-                break
+                total_info = " " + stripped
         return f"{first}{total_info}"
-    if "BibTeX entries" in raw or "参考文献" in raw:
-        return raw[:200]
     return raw[:200]
 
 
 def summarize_for_compression(llm, serialized_text: str,
                               agent_name: str = "",
                               mode: str = "structured") -> str:
-    """调用 LLM 将旧消息压缩为摘要。
+    """调用 LLM 把序列化文本压缩为摘要，失败回退规则摘要。
 
-    mode:
-      - "structured" (70% 阈值): 保留文件路径指针，Agent 需要时可重新 read_file
-      - "aggressive"  (90% 阈值): 尽可能浓缩，只保留最关键的决策和文件列表
+    paras:
+        llm: LLM 实例
+        serialized_text: serialize_for_compression 的输出
+        agent_name: Agent 名（日志用）
+        mode: structured 保留文件路径指针 / aggressive 极度浓缩
+    return: 摘要文本
     """
     if mode == "aggressive":
         system = "你是一个对话压缩助手。请极度精简地总结对话历史，只保留最重要的信息。"
@@ -168,30 +174,25 @@ def summarize_for_compression(llm, serialized_text: str,
             messages=[{"role": "user", "content": prompt}],
             system=system,
             max_tokens=512,
-        )
-        result = result.strip()
-        if not result:
-            result = fallback_summary(serialized_text)
-        return result
+        ).strip()
+        return result or fallback_summary(serialized_text)
     except Exception as e:
         logger.warning(f"[{agent_name}] 压缩 LLM 调用失败: {e}",
-                   extra={"event": "compression_error", "agent": agent_name})
+                       extra={"event": "compression_error", "agent": agent_name})
         return fallback_summary(serialized_text)
 
 
 def fallback_summary(serialized_text: str) -> str:
-    """规则型 fallback：当 LLM 压缩失败或返回空时，从序列化文本中提取关键信息"""
-    # 输出实例：
-    # [规则兜底摘要]
-    # 工具调用: read_file×2, write_file×1, parse_pdf×1
-    # 涉及文件: ./main.tex, ./ref.bib, ./paper.pdf
-    # 错误: Error: file not found ./tmp.tex
-    lines = serialized_text.split("\n")
+    """规则型兜底摘要：从序列化文本正则提取工具调用、文件、错误。
+
+    paras:
+        serialized_text: serialize_for_compression 的输出
+    return: "[规则兜底摘要]" 开头的文本
+    """
     tool_names: list[str] = []
     file_paths: list[str] = []
     errors: list[str] = []
-
-    for line in lines:
+    for line in serialized_text.split("\n"):
         m = re.search(r"tool_use\]:\s*(\w+)", line)
         if m:
             tool_names.append(m.group(1))
@@ -205,71 +206,26 @@ def fallback_summary(serialized_text: str) -> str:
 
     parts = []
     if tool_names:
-        tc = Counter(tool_names)
-        parts.append("工具调用: " + ", ".join(f"{name}×{cnt}" for name, cnt in tc.most_common(8)))
+        counts = Counter(tool_names)
+        parts.append("工具调用: " + ", ".join(f"{n}×{c}" for n, c in counts.most_common(8)))
     if file_paths:
         parts.append("涉及文件: " + ", ".join(file_paths[-8:]))
     if errors:
         parts.append("错误: " + "; ".join(errors[-3:]))
-
     return "[规则兜底摘要]\n" + "\n".join(parts) if parts else "[规则兜底摘要] 无可用信息"
 
 
-def compress_history(history: list[Message], keep_recent: int, context_window: int,
-                     llm, agent_name: str) -> list:
-    """压缩 _history（Agent 内部历史消息列表），返回新列表。
-
-    使用渐进式阈值：70% structured / 90% aggressive。
-    """
-    if not history or len(history) <= keep_recent:
-        return history
-
-    estimated = estimate_tokens(history)
-    structured_threshold = int(context_window * 0.70)
-    aggressive_threshold = int(context_window * 0.90)
-
-    if estimated < structured_threshold:
-        return history
-
-    old_messages = history[:-keep_recent]
-    recent_messages = history[-keep_recent:]
-
-    old_text = serialize_for_compression(old_messages)
-
-    if estimated >= aggressive_threshold:
-        mode = "aggressive"
-    else:
-        mode = "structured"
-
-    summary = summarize_for_compression(llm, old_text, agent_name=agent_name, mode=mode)
-
-    logger.info(
-        f"[{agent_name}] _history 压缩 ({mode}): {len(old_messages)}条 → 摘要 "
-        f"({len(old_text)} → {len(summary)} 字符, estimated={estimated} tokens, "
-        f"threshold={structured_threshold})",
-        extra={"event": "compression", "agent": agent_name, "mode": mode,
-               "old_count": len(old_messages), "new_chars": len(summary),
-               "tokens": estimated, "threshold": structured_threshold},
-    )
-
-    return [
-        Message(f"[上下文摘要 — 之前步骤的关键信息]\n\n{summary}", "user")
-    ] + recent_messages
-
-# messages: list[dict] 中的每个 dict 都包含 role 和 content 键
 def _stub_large_tool_results(messages: list[dict], keep_recent: int) -> list:
-    """路径指针替换：把旧消息中大内容工具的 tool_result 替换为文件路径指针。
+    """步骤 1 — 路径指针：把旧段大 tool_result 替换为文件路径指针。
 
-    零 LLM 调用的确定性减负（s08 的 micro_compact 思想）：
-    read_file/parse_pdf 等结果已被模型消费过，文件仍在磁盘上，
-    替换为 "[结果已省略 — 文件 {path} 共 N 字符；需要时重新调用 {tool}]" 指针即可，
-    Agent 需要时可重新读取。只动 content 字符串，不增删消息，
-    tool_use/tool_result 配对完整保留。
+    结果已被模型消费过且文件仍在磁盘，指针化即可；只改 content 不增删消息，
+    配对完整保留。copy-on-write，无替换返回原列表。
 
-    keep_recent=0 表示全库替换（reactive_compact 的最后手段用）。
-    返回新列表（copy-on-write），无替换时返回原列表对象。
+    paras:
+        messages: dict 消息列表
+        keep_recent: 最近 N 条不动；0 表示全库替换（reactive_compact 用）
+    return: 替换后的新列表；无替换时返回原列表
     """
-    # 建立 tool_use_id → (工具名, input) 映射，用于给 tool_result 找到来源工具
     tool_use_info: dict = {}
     for msg in messages:
         content = msg.get("content") if isinstance(msg, dict) else None
@@ -312,51 +268,16 @@ def _stub_large_tool_results(messages: list[dict], keep_recent: int) -> list:
     return result if changed else messages
 
 
-def is_context_overflow_error(e: Exception) -> bool:
-    """判断异常是否为 API 上下文超限（prompt_too_long 类错误）"""
-    text = f"{type(e).__name__}: {e}".lower()
-    return any(p in text for p in CONTEXT_OVERFLOW_PATTERNS)
-
-
-def reactive_compact(messages: list[dict], llm, agent_name: str,
-                     keep_recent: int = 5) -> list:
-    """紧急压缩：API 返回上下文超限后调用，压缩后由调用方重试一次。
-
-    两层递进：
-      1. 全库路径指针替换（含 recent 段——超限主因通常就是大 tool_result，
-         且只改 content 不破坏 tool_use/tool_result 配对）
-      2. 在指针化结果上做安全切分 + aggressive LLM 摘要（保留最近 keep_recent 条）
-    若切分不可行（cut<=0），返回仅做指针化的结果（已显著减小）。
-    """
-    logger.warning(
-        f"[{agent_name}] reactive_compact: 上下文超限，紧急压缩 {len(messages)} 条消息",
-        extra={"event": "reactive_compact", "agent": agent_name, "old_count": len(messages)},
-    )
-    stubbed = _stub_large_tool_results(messages, keep_recent=0)
-    cut = _safe_cut(stubbed, keep_recent)
-    if cut <= 0:
-        return stubbed
-    old_text = serialize_for_compression(stubbed[:cut])
-    summary = summarize_for_compression(llm, old_text, agent_name=agent_name, mode="aggressive")
-    compressed = [
-        {"role": "user", "content": f"[紧急压缩摘要 — 因上下文超限触发]\n\n{summary}"}
-    ]
-    compressed.extend(stubbed[cut:])
-    logger.warning(
-        f"[{agent_name}] reactive_compact 完成: {len(messages)} → {len(compressed)} 条",
-        extra={"event": "reactive_compact", "agent": agent_name, "new_count": len(compressed)},
-    )
-    return compressed
-
-
 def _safe_cut(messages: list[dict], keep_recent: int) -> int:
-    """计算安全切点：向前回退，避免 recent 段以孤立的 tool_result 开头。
+    """步骤 2 — 安全切点：向前回退，避免 recent 段以孤立 tool_result 开头。
 
-    消息结构中 assistant(tool_use) 与 user(tool_result) 成对相邻。
-    若切出的 recent 段以 tool_result 消息开头（其配对的 assistant tool_use
-    被切进摘要区），API 会因孤立 tool_result 拒绝请求。
-    向前回退把配对的 assistant(tool_use) 一并划入 recent 段。
-    返回 0 表示无法安全切分（整段都是配对区），调用方应跳过压缩。
+    若切出的 recent 段开头是 tool_result（其配对 tool_use 被切进摘要区），
+    API 会拒绝请求；向前回退把配对的 assistant(tool_use) 划入 recent 段。
+
+    paras:
+        messages: dict 消息列表
+        keep_recent: 最近保留条数
+    return: 安全切点；0 表示无法安全切分，调用方应跳过压缩
     """
     cut = len(messages) - keep_recent
     while 0 < cut < len(messages):
@@ -371,46 +292,54 @@ def _safe_cut(messages: list[dict], keep_recent: int) -> int:
     return max(cut, 0)
 
 
+def _pick_mode(estimated: int, context_window: int) -> tuple[str, int, int]:
+    """按渐进阈值选压缩档位。
+
+    paras:
+        estimated: 当前 token 估算值
+        context_window: 上下文窗口大小
+    return: (mode, structured_threshold, aggressive_threshold)
+    """
+    structured = int(context_window * 0.70)
+    aggressive = int(context_window * 0.90)
+    mode = "aggressive" if estimated >= aggressive else "structured"
+    return mode, structured, aggressive
+
+
 def compress_messages(messages: list[dict], keep_recent: int, context_window: int,
                       llm, agent_name: str,
                       anchor_input_tokens: int | None = None,
                       last_output_tokens: int = 0) -> list:
-    """压缩 step 循环中的 messages（dict 列表），返回新列表，不修改原列表。
+    """按四步管线压缩 step 循环中的 dict 消息列表，copy-on-write。
 
-    Token 估算策略（与 DeepSeek harness 的 anchor 模式对齐）：
-      - anchor 可用时：estimated = anchor_input_tokens + last_output_tokens
-        （前者是上轮 API 真实 input_tokens，覆盖了上轮历史 + system + tools；
-         后者是上轮模型回复的 token 数。两者相加约等于本轮历史 + 上轮回复，
-         更接近本轮实际 input 大小，比本地 estimate_tokens 准确得多）
-      - anchor 不可用时：fallback 到本地 estimate_tokens(messages)
-        （首次调用前，或压缩后 anchor 失效，或 response.usage 缺失时）
+    token 估算优先用 anchor（上轮 API 真实 input_tokens + output_tokens），
+    不可用时回退本地 estimate_tokens。
 
-    Args:
-        anchor_input_tokens: 上轮 API 返回的 response.usage.input_tokens。
-            None 表示无可用 anchor（首次调用/压缩后/调用失败）。
-        last_output_tokens: 上轮 API 返回的 response.usage.output_tokens。
-            anchor 可用时必填，默认 0。
+    paras:
+        messages: dict 消息列表
+        keep_recent: 压缩时保留的最近消息数
+        context_window: 上下文窗口大小
+        llm: LLM 实例（步骤 4 摘要用）
+        agent_name: Agent 名（日志用）
+        anchor_input_tokens: 上轮 API 真实 input_tokens；None 表示无 anchor
+        last_output_tokens: 上轮 API output_tokens
+    return: 压缩后的新列表；无需压缩时返回原列表
     """
     if len(messages) <= keep_recent:
         return messages
 
-    # ---- Token 估算：anchor 优先，本地 fallback ----
     if anchor_input_tokens is not None and anchor_input_tokens > 0:
-        # 用真实 usage 作 baseline，加上轮 output（即将进入本轮历史）
         estimated = anchor_input_tokens + (last_output_tokens or 0)
-        estimate_source = "anchor"  # 日志用
+        estimate_source = "anchor"
     else:
         estimated = estimate_tokens(messages)
-        estimate_source = "local"  # 日志用
+        estimate_source = "local"
 
-    structured_threshold = int(context_window * 0.70)
-    aggressive_threshold = int(context_window * 0.90)
-
+    mode, structured_threshold, _ = _pick_mode(estimated, context_window)
     if estimated < structured_threshold:
         return messages
 
-    # ---- 第一层：廉价确定性减负 —— 旧段大 tool_result → 文件路径指针 ----
-    # 替换后重新本地估算（anchor 是替换前的真实值，已失效）；降到阈值以下即可免掉 LLM 摘要
+    # 步骤 1 + 3：指针化旧段大 tool_result，重新估算，降到阈值以下即免摘要
     stubbed = _stub_large_tool_results(messages, keep_recent)
     if stubbed is not messages:
         estimated = estimate_tokens(stubbed)
@@ -419,40 +348,110 @@ def compress_messages(messages: list[dict], keep_recent: int, context_window: in
         if estimated < structured_threshold:
             logger.info(
                 f"[{agent_name}] 路径指针替换后免压缩: estimated={estimated} tokens "
-                f"< threshold={structured_threshold}（{estimate_source}）",
+                f"< threshold={structured_threshold}",
                 extra={"event": "stub_compact", "agent": agent_name, "tokens": estimated},
             )
             return messages
 
-    # ---- 安全切点：回退避开孤立 tool_result（配对保护） ----
+    # 步骤 2：安全切点
     cut = _safe_cut(messages, keep_recent)
     if cut <= 0:
         return messages
-    old_messages = messages[:cut]
-    recent_messages = messages[cut:]
+    old_messages, recent_messages = messages[:cut], messages[cut:]
 
+    # 步骤 4：LLM 摘要兜底
+    mode, structured_threshold, _ = _pick_mode(estimated, context_window)
     old_text = serialize_for_compression(old_messages)
-
-    if estimated >= aggressive_threshold:
-        mode = "aggressive"
-    else:
-        mode = "structured"
-
     summary = summarize_for_compression(llm, old_text, agent_name=agent_name, mode=mode)
 
     logger.info(
         f"[{agent_name}] messages 压缩 ({mode}, source={estimate_source}): "
-        f"{len(old_messages)}条 → 摘要 "
-        f"({len(old_text)} → {len(summary)} 字符, estimated={estimated} tokens, "
-        f"threshold={structured_threshold})",
+        f"{len(old_messages)}条 → 摘要 ({len(old_text)} → {len(summary)} 字符, "
+        f"estimated={estimated} tokens)",
         extra={"event": "compression", "agent": agent_name, "mode": mode,
                "old_count": len(old_messages), "new_chars": len(summary),
                "tokens": estimated, "threshold": structured_threshold,
                "source": estimate_source},
     )
 
-    compressed = [
-        {"role": "user", "content": f"[上下文摘要 — 之前步骤的关键信息]\n\n{summary}"}
-    ]
+    compressed = [{"role": "user",
+                   "content": f"[上下文摘要 — 之前步骤的关键信息]\n\n{summary}"}]
     compressed.extend(recent_messages)
+    return compressed
+
+
+def compress_history(history: list[Message], keep_recent: int, context_window: int,
+                     llm, agent_name: str) -> list:
+    """按四步管线压缩 Agent 的 _history（Message 对象列表）。
+
+    paras:
+        history: Message 对象列表
+        keep_recent: 压缩时保留的最近消息数
+        context_window: 上下文窗口大小
+        llm: LLM 实例
+        agent_name: Agent 名（日志用）
+    return: 压缩后的列表；无需压缩时返回原列表
+    """
+    if not history or len(history) <= keep_recent:
+        return history
+
+    estimated = estimate_tokens(history)
+    mode, structured_threshold, _ = _pick_mode(estimated, context_window)
+    if estimated < structured_threshold:
+        return history
+
+    old_messages, recent_messages = history[:-keep_recent], history[-keep_recent:]
+    old_text = serialize_for_compression(old_messages)
+    summary = summarize_for_compression(llm, old_text, agent_name=agent_name, mode=mode)
+
+    logger.info(
+        f"[{agent_name}] _history 压缩 ({mode}): {len(old_messages)}条 → 摘要 "
+        f"({len(old_text)} → {len(summary)} 字符, estimated={estimated} tokens)",
+        extra={"event": "compression", "agent": agent_name, "mode": mode,
+               "old_count": len(old_messages), "new_chars": len(summary),
+               "tokens": estimated, "threshold": structured_threshold},
+    )
+
+    return [Message(f"[上下文摘要 — 之前步骤的关键信息]\n\n{summary}", "user")] + recent_messages
+
+
+def is_context_overflow_error(e: Exception) -> bool:
+    """判断异常是否为 API 上下文超限。
+
+    paras:
+        e: 捕获到的异常
+    return: 是上下文超限错误返回 True
+    """
+    text = f"{type(e).__name__}: {e}".lower()
+    return any(p in text for p in CONTEXT_OVERFLOW_PATTERNS)
+
+
+def reactive_compact(messages: list[dict], llm, agent_name: str,
+                     keep_recent: int = 5) -> list:
+    """紧急压缩：API 上下文超限后调用（全库指针化 + 安全切分 + aggressive 摘要）。
+
+    paras:
+        messages: dict 消息列表
+        llm: LLM 实例
+        agent_name: Agent 名（日志用）
+        keep_recent: 摘要后保留的最近消息数
+    return: 压缩后的消息列表（调用方应重试一次）
+    """
+    logger.warning(
+        f"[{agent_name}] reactive_compact: 上下文超限，紧急压缩 {len(messages)} 条消息",
+        extra={"event": "reactive_compact", "agent": agent_name, "old_count": len(messages)},
+    )
+    stubbed = _stub_large_tool_results(messages, keep_recent=0)
+    cut = _safe_cut(stubbed, keep_recent)
+    if cut <= 0:
+        return stubbed
+    old_text = serialize_for_compression(stubbed[:cut])
+    summary = summarize_for_compression(llm, old_text, agent_name=agent_name, mode="aggressive")
+    compressed = [{"role": "user",
+                   "content": f"[紧急压缩摘要 — 因上下文超限触发]\n\n{summary}"}]
+    compressed.extend(stubbed[cut:])
+    logger.warning(
+        f"[{agent_name}] reactive_compact 完成: {len(messages)} → {len(compressed)} 条",
+        extra={"event": "reactive_compact", "agent": agent_name, "new_count": len(compressed)},
+    )
     return compressed

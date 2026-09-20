@@ -1,30 +1,30 @@
-"""持久文献库 — reference_library 的落盘/读取，跨任务累积。
-
-与 .bib 分工：.bib 只服务 LaTeX 引用；这里的 JSON 库存储信息完备的文献
-（含 abstract / keywords / doi 等），是 LiteratureAgent 每次运行时的「先读后写」
-缓存：优先从库中检索相关文献，扩充后再写回。
-
-- load_library(path) -> list[Paper]：读取 JSON 为 Paper 列表
-- save_library(path, papers) -> list[Paper]：合并去重后写回，返回合并结果
-- merge_papers(*lists) -> list[Paper]：按 cite_key 去重合并
-"""
+"""持久文献库 — reference_library 的 JSON 落盘/读取，跨任务累积，按 cite_key 去重合并"""
 
 import json as json_mod
 from pathlib import Path
 
 from .paper import Paper, Source
 
-# 持久文献库目录（library_dir）下存储的 JSON 文件名
 LIBRARY_FILENAME = "reference_library.json"
 
 
 def _library_file(dir_path: str) -> Path:
-    """library_dir 是目录，实际 JSON 文件是其中的 reference_library.json。"""
+    """拼出库文件完整路径。
+
+    paras:
+        dir_path: 文献库目录
+    return: 目录下 reference_library.json 的 Path
+    """
     return Path(dir_path) / LIBRARY_FILENAME
 
 
 def load_library(path: str) -> list[Paper]:
-    """读取持久文献库 JSON 为 Paper 列表。文件不存在或损坏时返回空列表。"""
+    """读取文献库 JSON 为 Paper 列表。
+
+    paras:
+        path: 文献库目录
+    return: Paper 列表；文件不存在或损坏返回空列表
+    """
     if not path:
         return []
     p = _library_file(path)
@@ -48,9 +48,12 @@ def load_library(path: str) -> list[Paper]:
 
 
 def save_library(path: str, papers: list[Paper]) -> list[Paper]:
-    """把 papers 合并进 path 现有内容（按 cite_key 去重）后写回，返回合并结果。
+    """把 papers 合并进现有库（按 cite_key 去重，幂等）后写回。
 
-    path 是文献库目录，实际写入其中的 reference_library.json。幂等：按 cite_key 去重。
+    paras:
+        path: 文献库目录
+        papers: 要合入的 Paper 列表
+    return: 合并后的完整 Paper 列表
     """
     existing = load_library(path)
     merged = merge_papers(existing, papers)
@@ -62,7 +65,12 @@ def save_library(path: str, papers: list[Paper]) -> list[Paper]:
 
 
 def merge_papers(*paper_lists) -> list[Paper]:
-    """按 cite_key 去重合并多个 Paper 列表，保留先出现的条目。"""
+    """按 cite_key 去重合并多个 Paper 列表，保留先出现的条目。
+
+    paras:
+        paper_lists: 任意个 Paper 列表
+    return: 去重后的 Paper 列表
+    """
     seen: set[str] = set()
     merged: list[Paper] = []
     for papers in paper_lists:
@@ -77,7 +85,12 @@ def merge_papers(*paper_lists) -> list[Paper]:
 
 
 def _paper_from_dict(d: dict) -> Paper:
-    """从 dict 重建 Paper 对象。source 非法时回退 LLM，year 非法时回退 0。"""
+    """从 dict 重建 Paper 对象。
+
+    paras:
+        d: Paper.to_dict 的输出
+    return: Paper 对象（source 非法回退 LLM，year 非法回退 0）
+    """
     src = d.get("source", "llm")
     try:
         source = Source(src)

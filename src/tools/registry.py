@@ -1,9 +1,4 @@
-"""
-工具注册表 — 管理每个 Agent 专用的工具集合
-
-不同于 hello_agents 的全局单例，这里每个 Agent 创建自己的 ToolRegistry 实例，
-实现不同 Agent 拥有不同工具（权限隔离）。
-"""
+"""工具注册表 — 每个 Agent 独立实例，实现不同 Agent 的工具权限隔离。"""
 
 import logging
 from .base import Tool
@@ -18,25 +13,26 @@ class ToolRegistry:
         self._tools: dict[str, Tool] = {}
         self._functions: dict[str, dict] = {}
 
-    # ---- 注册 ----
-
     def register(self, tool: Tool):
-        """注册一个 Tool 实例"""
+        """注册一个 Tool 实例。
+
+        paras:
+            tool: Tool 实例，重名时覆盖并告警
+        """
         if tool.name in self._tools:
             logger.warning(f"Tool '{tool.name}' already registered, overwriting.")
         self._tools[tool.name] = tool
 
     def register_function(self, name: str, description: str, func,
                           properties: dict, required: list[str] | None = None):
-        """
-        注册一个普通函数作为工具（轻量方式，不需要写 Tool 子类）。
+        """注册一个普通函数作为工具（轻量方式，不需要写 Tool 子类）。
 
-        参数：
-          name:        工具名
-          description: 工具描述
-          func:        可调用对象
-          properties:  input_schema 的 properties 部分
-          required:    必填参数列表
+        paras:
+            name: 工具名
+            description: 工具描述
+            func: 可调用对象
+            properties: input_schema 的 properties 部分
+            required: 必填参数列表
         """
         self._functions[name] = {
             "description": description,
@@ -45,18 +41,20 @@ class ToolRegistry:
             "required": required or [],
         }
 
-    # ---- 执行 ----
-
     def execute(self, name: str, params: dict) -> str:
-        """执行一个工具并返回字符串结果"""
-        # 优先查 Tool 实例
+        """执行一个工具（先查 Tool 实例，再查注册函数）。
+
+        paras:
+            name: 工具名
+            params: 工具参数字典
+        return: 工具返回的字符串；未知工具或执行异常返回 "Error: ..." 字符串
+        """
         if name in self._tools:
             try:
                 return self._tools[name].execute(**params)
             except Exception as e:
                 return f"Error: tool '{name}' failed — {e}"
 
-        # 再查注册的函数
         if name in self._functions:
             try:
                 return self._functions[name]["func"](**params)
@@ -65,10 +63,11 @@ class ToolRegistry:
 
         return f"Error: unknown tool '{name}'."
 
-    # ---- 输出 ----
-
     def to_anthropic_format(self) -> list[dict]:
-        """转为 Anthropic API 的 tools 参数格式"""
+        """转为 Anthropic API 的 tools 参数格式。
+
+        return: 所有 Tool 实例与注册函数的 tool 格式列表
+        """
         result = []
         for tool in self._tools.values():
             result.append(tool.to_anthropic_format())
@@ -85,14 +84,28 @@ class ToolRegistry:
         return result
 
     def list_names(self) -> list[str]:
+        """返回所有已注册工具名。
+
+        return: 工具名列表
+        """
         return list(self._tools.keys()) + list(self._functions.keys())
 
     def get_tool(self, name: str) -> Tool | None:
-        """return Tool 实例（如果存在）"""
+        """获取指定名称的 Tool 实例。
+
+        paras:
+            name: 工具名
+        return: Tool 实例；不存在返回 None
+        """
         return self._tools.get(name)
 
     def subset(self, names: list[str]) -> "ToolRegistry":
-        """创建子注册表，只包含指定名称的工具"""
+        """创建子注册表，只包含指定名称的工具。
+
+        paras:
+            names: 工具名列表
+        return: 新的 ToolRegistry 实例
+        """
         sub = ToolRegistry()
         for name in names:
             if name in self._tools:

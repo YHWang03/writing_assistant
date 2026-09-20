@@ -1,14 +1,4 @@
-"""
-LiteratureAgent — 文献处理 Agent
-
-负责：
-- 解析用户提供的 PDF 论文
-- 提取元数据（标题、作者、摘要、期刊等）
-- 总结核心贡献
-- 在线搜索补充文献
-- 生成 BibTeX 条目
-- 写入 references.bib 文件
-"""
+"""LiteratureAgent — 文献处理 Agent：解析 PDF、检索文献、生成 BibTeX 并维护文献库。"""
 
 import logging
 
@@ -18,11 +8,15 @@ from ..core.library import save_library
 from ..prompts import load_prompt
 from ..tools.registry import ToolRegistry
 from ..tools.builtin import (
-    ParsePDFTool, GetPaperTextTool, SearchPapersTool, VerifyPaperTool,
+    GetPaperTextTool, SearchPapersTool, VerifyPaperTool,
     GenerateBibtexTool, SummarizePaperTool, WriteBibFileTool, WriteFileTool,
     ReadFileTool, ListFilesTool, AddReferenceTool, ReadContextTool,
     GenerateBibFromRefLibTool, FinishTool, ParseAndStoreTool,
     ListPaperFilesTool, FindRelevantPapersTool, WriteLibraryTool,
+)
+from ..hooks.builtin import (
+    MemoryRecallHook, DeadlineNudgeHook, CollectWrittenPathsHook,
+    FinishNudgeHook, OutputGateHook, MemoryExtractHook,
 )
 
 
@@ -32,6 +26,16 @@ class LiteratureAgent(Agent):
     def __init__(self, llm: LLM,
                  max_steps: int = 15, max_tokens: int = 8192,
                  run_mode: str = "react", min_relevant: int = 15):
+        """初始化 LiteratureAgent，注册工具集并设置检索阈值与产出闸门。
+
+        paras:
+            llm: LLM 实例
+            max_steps: 最大执行步数
+            max_tokens: 单次生成最大 token 数
+            run_mode: 运行模式（react/plan_execute）
+            min_relevant: 相关文献检索的最低数量阈值
+        return: 无
+        """
         super().__init__(
             name="LiteratureAgent", llm=llm,
             system_prompt=load_prompt("literature_agent.md"),
@@ -39,11 +43,16 @@ class LiteratureAgent(Agent):
             run_mode=run_mode,
         )
         self._setup_tools()
+        self._setup_hooks()
         self.min_relevant = min_relevant
-        # 确定性产出闸门：完成前必须写出 .bib 文件（存在且非空）才允许 finish
         self.required_output_exts = [".bib"]
 
     def _setup_tools(self):
+        """注册本 Agent 的工具集。
+
+        paras: 无
+        return: 无
+        """
         self.tool_registry = ToolRegistry()
         self.tool_registry.register(ParseAndStoreTool())
         self.tool_registry.register(GetPaperTextTool())
@@ -66,10 +75,25 @@ class LiteratureAgent(Agent):
         self.tool_registry.register(WriteLibraryTool())
         self.tool_registry.register(FinishTool())
 
+    def _setup_hooks(self):
+        """注册本 Agent 的 hooks。
+
+        paras: 无
+        return: 无
+        """
+        self.hooks.register(MemoryRecallHook())
+        self.hooks.register(DeadlineNudgeHook())
+        self.hooks.register(CollectWrittenPathsHook())
+        self.hooks.register(FinishNudgeHook())
+        self.hooks.register(OutputGateHook())
+        self.hooks.register(MemoryExtractHook())
+
     def _sync_context_to_tools(self):
-        """将 context.add_reference 注入到 AddReferenceTool，
-        将 reference_library 注入到 GenerateBibFromRefLibTool"""
-        # 每个任务开始重置搜索计数，防止跨 dispatch 累积（配合 search_papers 硬上限）
+        """重置搜索计数，并将 context 中的引用函数与文献库注入到各工具。
+
+        paras: 无
+        return: 无
+        """
         try:
             search_tool = self.tool_registry.get_tool("search_papers")
             if search_tool is not None and hasattr(search_tool, "reset"):
@@ -124,12 +148,22 @@ class LiteratureAgent(Agent):
                 pass
 
     def run(self, input_text: str) -> str:
+        """运行 LiteratureAgent 执行循环，结束后兜底落盘文献库。
+
+        paras:
+            input_text: 任务输入文本
+        return: 执行结果文本
+        """
         result = self._run_loop(input_text, verbose=True)
         self._persist_library()
         return result
 
     def _persist_library(self):
-        """任务结束后兜底落盘 reference_library，不依赖 agent 是否调用 write_library。"""
+        """任务结束后兜底落盘 reference_library，不依赖 agent 是否调用 write_library。
+
+        paras: 无
+        return: 无
+        """
         if self.context is None:
             return
         try:

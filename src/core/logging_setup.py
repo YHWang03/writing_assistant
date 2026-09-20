@@ -26,6 +26,12 @@ class StructuredFormatter(logging.Formatter):
     )
 
     def format(self, record: logging.LogRecord) -> str:
+        """把日志记录格式化为单行 JSON。
+
+        paras:
+            record: 日志记录
+        return: JSON 文本
+        """
         entry = {
             "ts": record.created,
             "level": record.levelname,
@@ -35,7 +41,7 @@ class StructuredFormatter(logging.Formatter):
 
         for key in self._STRUCTURED_KEYS:
             if key == "event":
-                continue  # 已在上面处理
+                continue
             val = getattr(record, key, None)
             if val is not None:
                 entry[key] = val
@@ -44,9 +50,11 @@ class StructuredFormatter(logging.Formatter):
 
 
 def setup_structured_logging(log_path: Path) -> Path:
-    """为根 logger 添加结构化 JSONL 输出 Handler。
+    """为根 logger 添加 JSONL 结构化输出 Handler。
 
-    返回结构化日志文件路径。
+    paras:
+        log_path: 文本日志路径（结构化日志写到同目录 structured/ 下同名 .jsonl）
+    return: 结构化日志文件路径
     """
     logs_dir = log_path.parent
     structured_dir = logs_dir / "structured"

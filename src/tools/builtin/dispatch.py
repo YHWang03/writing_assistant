@@ -1,16 +1,10 @@
-"""分派工具 — MasterAgent 分派任务给子 Agent
-- DispatchTaskTool: 分派任务给指定子 Agent
-"""
+"""分派工具 — MasterAgent 分派任务给子 Agent。"""
 
 from ..base import Tool
 
 
 class DispatchTaskTool(Tool):
-    """
-    分派任务给指定的子 Agent 执行
-    实现完全依赖于dispatch_func
-    需要通过set_dispatch方法设置dispatch_func，才能正常工作
-    """
+    """分派任务给指定的子 Agent 执行（依赖注入 dispatch_func）"""
 
     def __init__(self, dispatch_func=None):
         super().__init__(
@@ -25,9 +19,18 @@ class DispatchTaskTool(Tool):
         self._dispatch = dispatch_func
 
     def set_dispatch(self, dispatch_func):
+        """注入分派回调。
+
+        paras:
+            dispatch_func: callable(agent_name, task) -> str
+        """
         self._dispatch = dispatch_func
 
     def get_parameters(self) -> dict:
+        """返回工具参数的 JSON Schema 定义。
+
+        return: input_schema 字典
+        """
         return {
             "type": "object",
             "properties": {
@@ -44,6 +47,13 @@ class DispatchTaskTool(Tool):
         }
 
     def execute(self, agent_name: str, task: str) -> str:
+        """分派任务给指定子 Agent。
+
+        paras:
+            agent_name: 子 Agent 名称
+            task: 任务描述
+        return: 子 Agent 的执行结果字符串；未注入回调返回错误字符串
+        """
         if self._dispatch is None:
             return "Error: dispatch_task 工具未正确配置（缺少 dispatch_func）"
         return self._dispatch(agent_name, task)

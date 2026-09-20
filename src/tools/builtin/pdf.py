@@ -1,7 +1,4 @@
-"""PDF 解析工具
-- ParsePDFTool: 解析 PDF 提取元数据（支持单篇和批量并行）
-- GetPaperTextTool: 获取 PDF 原始文本
-"""
+"""PDF 解析工具 — 元数据提取（单篇/批量并行）与原文获取。"""
 
 import html
 import json as json_mod
@@ -13,10 +10,7 @@ from ._cite_key import make_cite_key
 
 
 class ParsePDFTool(Tool):
-    """
-    解析 PDF 文件，提取元数据和全文内容。支持单篇和批量并行处理。
-    使用pymupdf提取文本，调用llm提取title，abstract等
-    """
+    """解析 PDF 提取元数据，支持单篇与批量并行"""
 
     def __init__(self):
         super().__init__(
@@ -27,6 +21,10 @@ class ParsePDFTool(Tool):
         )
 
     def get_parameters(self) -> dict:
+        """返回工具参数的 JSON Schema 定义。
+
+        return: input_schema 字典
+        """
         return {
             "type": "object",
             "properties": {
@@ -50,18 +48,29 @@ class ParsePDFTool(Tool):
 
     def execute(self, pdf_path: str = "", pdf_paths: list[str] | None = None,
                 max_workers: int = 4) -> str:
-        # 单篇模式
+        """解析 PDF 提取元数据。
+
+        paras:
+            pdf_path: 单篇模式文件路径
+            pdf_paths: 批量模式路径列表
+            max_workers: 批量模式最大线程数
+        return: JSON 字符串；单篇 LLM 解析失败时返回 fallback 指示（回退 get_paper_text）
+        """
         if pdf_path:
             return self._parse_single(pdf_path)
 
-        # 批量并行模式
         if pdf_paths:
             return self._parse_batch(pdf_paths, max_workers)
 
         return json_mod.dumps({"error": "请提供 pdf_path 或 pdf_paths 参数"})
 
     def _parse_single(self, pdf_path: str) -> str:
-        """处理单篇 PDF"""
+        """解析单篇 PDF，LLM 解析失败时返回 fallback 指示。
+
+        paras:
+            pdf_path: PDF 文件路径
+        return: JSON 字符串（元数据或 fallback 指示）
+        """
         path = Path(pdf_path)
         if not path.exists():
             return json_mod.dumps({"error": f"文件不存在: {pdf_path}", "file": pdf_path})
@@ -82,11 +91,9 @@ class ParsePDFTool(Tool):
             return json_mod.dumps({"error": "PDF 内容为空", "file": pdf_path})
 
         result = self._extract_with_llm(full_text[:3000], pdf_path)
-        # 检查 LLM 解析是否失败
         try:
             parsed = json_mod.loads(result)
             if "error" in parsed:
-                # LLM 解析失败，自动 fallback 到 get_paper_text
                 return json_mod.dumps({
                     "fallback": "get_paper_text",
                     "message": "parse_pdf 的 LLM 解析失败，已自动 fallback 到 get_paper_text",
@@ -96,7 +103,6 @@ class ParsePDFTool(Tool):
             parsed["file"] = pdf_path
             return json_mod.dumps(parsed, ensure_ascii=False)
         except json_mod.JSONDecodeError:
-            # LLM 返回非 JSON，也自动 fallback
             return json_mod.dumps({
                 "fallback": "get_paper_text",
                 "message": "parse_pdf 的 LLM 解析失败（返回非 JSON），已自动 fallback 到 get_paper_text",
@@ -105,7 +111,13 @@ class ParsePDFTool(Tool):
             }, ensure_ascii=False)
 
     def _parse_batch(self, pdf_paths: list[str], max_workers: int) -> str:
-        """并行处理多篇 PDF"""
+        """并行解析多篇 PDF。
+
+        paras:
+            pdf_paths: PDF 路径列表
+            max_workers: 最大线程数
+        return: JSON 字符串，含 total/success/failed/results/errors
+        """
         results = []
         errors = []
         workers = min(max_workers, len(pdf_paths))
@@ -126,7 +138,6 @@ class ParsePDFTool(Tool):
                 except Exception as e:
                     errors.append({"error": str(e), "file": pdf_path})
 
-        # 构建返回
         output = {
             "total": len(pdf_paths),
             "success": len(results),
@@ -139,7 +150,12 @@ class ParsePDFTool(Tool):
         return json_mod.dumps(output, ensure_ascii=False, indent=2)
 
     def _parse_one_worker(self, pdf_path: str) -> dict:
-        """单个 worker：PDF 提取 + LLM 解析，返回 dict"""
+        """单 worker 解析一篇 PDF（提取文本 + LLM 提取元数据）。
+
+        paras:
+            pdf_path: PDF 文件路径
+        return: 元数据 dict；失败返回含 error 的 dict
+        """
         path = Path(pdf_path)
         if not path.exists():
             return {"error": f"文件不存在: {pdf_path}", "file": pdf_path}
@@ -168,6 +184,13 @@ class ParsePDFTool(Tool):
             return {"error": "LLM 返回非 JSON", "file": pdf_path, "raw": result[:200]}
 
     def _extract_with_llm(self, text: str, pdf_path: str = "") -> str:
+        """用 LLM 从 PDF 文本中提取论文元数据。
+
+        paras:
+            text: PDF 文本（前 3000 字符）
+            pdf_path: PDF 文件路径（用于错误报告）
+        return: JSON 字符串；失败返回 {"error": ...}
+        """
         prompt = (
             "从以下 PDF 文本中提取论文元数据，以 JSON 格式返回。提取不到的字段设为空字符串。\n\n"
             "返回格式（只返回 JSON，不要其他内容）:\n"
@@ -192,7 +215,7 @@ class ParsePDFTool(Tool):
 
 
 class ParseAndStoreTool(Tool):
-    """解析 PDF 并自动入库，一步到位。返回简要摘要，不返回完整元数据。"""
+    """解析 PDF 并自动入库，返回简要摘要而不返回完整元数据"""
 
     def __init__(self):
         super().__init__(
@@ -202,13 +225,23 @@ class ParseAndStoreTool(Tool):
                         "返回简要摘要（入库数、失败数），不返回完整元数据以节省上下文。"
         )
         self._parse_tool = ParsePDFTool()
-        self._add_func = None  # 注入 context.add_reference
-        self._attempted_files: set[str] = set()  # 已成功入库的 PDF 路径，跨 dispatch 保留，避免重复解析（失败的不记录，允许重试）
+        self._add_func = None
+        # 已成功入库的 PDF 路径（跨 dispatch 保留）；失败不记录以允许重试
+        self._attempted_files: set[str] = set()
 
     def set_add_func(self, add_func):
+        """注入入库回调（context.add_reference）。
+
+        paras:
+            add_func: 接收 Paper 对象的可调用对象
+        """
         self._add_func = add_func
 
     def get_parameters(self) -> dict:
+        """返回工具参数的 JSON Schema 定义。
+
+        return: input_schema 字典
+        """
         return {
             "type": "object",
             "properties": {
@@ -232,10 +265,18 @@ class ParseAndStoreTool(Tool):
 
     def execute(self, pdf_path: str = "", pdf_paths: list[str] | None = None,
                 max_workers: int = 4) -> str:
+        """解析 PDF 并将元数据入库（幂等：已成功入库的文件跳过）。
+
+        paras:
+            pdf_path: 单篇模式文件路径
+            pdf_paths: 批量模式路径列表
+            max_workers: 批量模式最大线程数
+        return: JSON 字符串，含 stored/failed/skipped/failures 等统计；
+                必备字段（title/authors/year）缺失时不入库，只计入失败报告
+        """
         if self._add_func is None:
             return json_mod.dumps({"error": "parse_and_store 工具未注入上下文"})
 
-        # 幂等：已成功入库的文件直接跳过，不重复跑 LLM 解析（跨 dispatch 保留）
         files = [pdf_path] if pdf_path else list(pdf_paths or [])
         new_files = [f for f in files if f not in self._attempted_files]
         skipped = [f for f in files if f in self._attempted_files]
@@ -247,30 +288,24 @@ class ParseAndStoreTool(Tool):
                 "note": "所有传入文件均已处理过，已跳过（避免重复解析）。请直接调用 generate_bib_from_ref_library 生成 .bib。",
             }, ensure_ascii=False)
 
-        # 复用 ParsePDFTool 解析（只处理未尝试过的新文件）
         raw = self._parse_tool.execute(
             pdf_path=(new_files[0] if pdf_path else ""),
             pdf_paths=(new_files if pdf_paths else None),
             max_workers=max_workers,
         )
-        # 「已处理」标记改到下方入库成功时逐文件记录（失败的文件不标记，允许重试恢复）
 
-        # 统一解析结果为 list[dict]
         try:
             data = json_mod.loads(raw)
         except json_mod.JSONDecodeError:
             return json_mod.dumps({"error": "parse_pdf 返回非 JSON", "raw": raw[:500]})
 
         if isinstance(data, dict) and "results" in data:
-            # 批量模式
             papers = data.get("results", [])
             errors = data.get("errors", [])
         elif isinstance(data, dict) and "title" in data:
-            # 单篇成功
             papers = [data]
             errors = []
         elif isinstance(data, dict) and "fallback" in data:
-            # 单篇 fallback — 无法入库
             return json_mod.dumps({
                 "stored": 0, "failed": 1,
                 "failed_files": [data.get("file", "")],
@@ -286,10 +321,9 @@ class ParseAndStoreTool(Tool):
             papers = []
             errors = []
 
-        # 入库（保守：必备字段缺失时不入库，只上报报告）
         stored_keys = []
         failed_files = []
-        failures = []  # 详细失败报告：file + reason + missing
+        failures = []
         for p in papers:
             missing = self._missing_fields(p)
             if missing:
@@ -328,7 +362,6 @@ class ParseAndStoreTool(Tool):
                 )
                 self._add_func(ref)
                 stored_keys.append(cite_key)
-                # 入库成功才记为「已处理」；失败的文件不记录，重派后仍可重试恢复
                 if p.get("file"):
                     self._attempted_files.add(p["file"])
             except Exception as e:
@@ -361,10 +394,11 @@ class ParseAndStoreTool(Tool):
 
     @staticmethod
     def _missing_fields(p: dict) -> list[str]:
-        """检测引用文献必备字段（title/authors/year），返回缺失字段列表。
+        """检测必备字段（title/authors/year），返回缺失字段列表。
 
-        注意：journal 不再作为必备字段 —— 扩展摘要/预印本 PDF 首页常无期刊名，
-        缺失期刊不应导致整条文献被丢弃（宁可先入库，期刊留空待后续补齐）。
+        paras:
+            p: 单篇解析结果 dict
+        return: 缺失字段名列表；journal 不作为必备字段（预印本首页常无期刊名，缺失不应丢弃整条文献）
         """
         return [f for f in ("title", "authors", "year") if not p.get(f)]
 
@@ -379,6 +413,10 @@ class GetPaperTextTool(Tool):
         )
 
     def get_parameters(self) -> dict:
+        """返回工具参数的 JSON Schema 定义。
+
+        return: input_schema 字典
+        """
         return {
             "type": "object",
             "properties": {
@@ -392,6 +430,15 @@ class GetPaperTextTool(Tool):
 
     def execute(self, pdf_path: str, start_page: int = 1,
                 end_page: int = -1, max_chars: int = 50000) -> str:
+        """获取 PDF 指定页范围的纯文本（带分页标记）。
+
+        paras:
+            pdf_path: PDF 文件路径
+            start_page: 起始页（从 1 起）
+            end_page: 结束页，-1 表示末页
+            max_chars: 最大返回字符数
+        return: 分页文本，超长截断；失败返回 "Error: ..." 字符串
+        """
         path = Path(pdf_path)
         if not path.exists():
             return f"Error: 文件不存在: {pdf_path}"

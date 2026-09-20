@@ -1,8 +1,4 @@
-"""cite_key 生成 — authorYearFirstWord 格式
-
-供 bib.py（GenerateBibtexTool）与 pdf.py（ParseAndStoreTool）共用，
-消除重复实现。
-"""
+"""cite_key 生成（authorYearFirstWord 格式），供 bib.py 与 pdf.py 共用。"""
 
 import re
 
@@ -10,7 +6,11 @@ import re
 def make_cite_key(authors: str, year: int, title: str) -> str:
     """生成 cite_key：第一作者姓 + 年份 + 标题首词（小写，如 vidale1988finite）。
 
-    缺作者/年份时返回空串，调用方据此判定无法生成。
+    paras:
+        authors: 作者列表（逗号分隔）
+        year: 发表年份
+        title: 论文标题
+    return: cite_key；缺作者或年份时返回空串，调用方据此判定无法生成
     """
     if not authors or not year:
         return ""

@@ -1,15 +1,8 @@
-"""
-AgentMemory — 单一长期记忆存储（每个 Agent 一份，JSON 持久化）
+"""AgentMemory — 单 Agent 长期记忆（JSON 持久化，每 Agent 一份文件）。
 
-参考 learn-claude-code s09 的设计，不再由 Agent 自主决定读写记忆，而是由
-harness（Agent 基类的 hooks）在任务边界自动调用：
-  - recall():   run() 入口，根据任务文本选出相关记忆，拼进 system prompt
-  - extract():  run() 结束（Stop hook），由 LLM 从对话中抽取可持久化知识
-  - consolidate(): 记录数达到阈值后合并去重（原子替换，失败回滚）
-
-存储格式：单个 JSON 文件，记录列表，每条记录 {name, type, description, body}。
-type 为内容标签（user/feedback/project/reference），用于召回时的目录选择。
-临时性知识（scope=current_task）不入库。
+由 hooks 在任务边界自动调用：recall() 入口召回、extract() 出口提取、
+consolidate() 达阈值后合并整理（原子替换，失败回滚）。
+记录格式 {name, type, description, body, created_at}；临时性知识不入库。
 """
 
 import json
@@ -18,12 +11,14 @@ import re
 from datetime import datetime
 from pathlib import Path
 
+from ..core.utils import extract_json_array
+
 logger = logging.getLogger(__name__)
 
-# 记忆内容类型标签（用于召回时 LLM 读目录做选择）
+# 记忆内容类型标签
 MEMORY_TYPES = ("user", "feedback", "project", "reference")
 
-# 含这些标记的知识视为临时性，不入库（中英文）
+# 临时性知识标记黑名单：命中则不入库
 TEMPORARY_MEMORY_MARKERS = (
     "this session", "current session", "this turn", "current turn",
     "this task", "current task", "for now", "just this time", "today only",
@@ -31,42 +26,32 @@ TEMPORARY_MEMORY_MARKERS = (
     "暂时", "本步", "此次任务",
 )
 
-# 每次召回的相关记忆条数上限
 RECALL_LIMIT = 5
-# 召回内容总字符预算
 RECALL_CHAR_BUDGET = 20000
-# 触发合并整理的最小记录数
 CONSOLIDATE_THRESHOLD = 10
-# 合并后保留的最大记录数
 MAX_CONSOLIDATED = 30
-# 整理输入目录的字符上限（超大库拒绝整理，避免单次调用过大）
 CONSOLIDATE_INPUT_CHAR_LIMIT = 20000
 
 
 def memory_slug(name: str) -> str:
-    """记忆名称归一化为 slug，用于去重比较（"My Memory" -> "my-memory"）"""
+    """记忆名称归一化为 slug。
+
+    paras:
+        name: 原始名称
+    return: 如 "my-memory" 的 slug；空名返回 "memory"
+    """
     slug = re.sub(r"[^\w]+", "-", name.lower()).strip("-_")
     return slug or "memory"
 
 
 def _normalized_text(value: str) -> str:
-    """文本归一化（小写 + 空白折叠），用于去重比较"""
+    """文本归一化（小写 + 空白折叠）用于去重比较。
+
+    paras:
+        value: 原始文本
+    return: 归一化后的文本
+    """
     return " ".join(value.lower().split())
-
-
-def extract_json_array(text: str) -> list:
-    """从 LLM 返回文本中提取第一个合法 JSON 数组，失败返回空列表"""
-    decoder = json.JSONDecoder()
-    for pos, ch in enumerate(text):
-        if ch != "[":
-            continue
-        try:
-            value, _ = decoder.raw_decode(text[pos:])
-        except json.JSONDecodeError:
-            continue
-        if isinstance(value, list):
-            return value
-    return []
 
 
 class AgentMemory:
@@ -77,17 +62,30 @@ class AgentMemory:
                  recall_limit: int = RECALL_LIMIT,
                  recall_char_budget: int = RECALL_CHAR_BUDGET,
                  consolidate_threshold: int = CONSOLIDATE_THRESHOLD):
+        """初始化并加载已有记录。
+
+        paras:
+            path: JSON 存储文件路径
+            max_records: 记录容量上限，超出淘汰最老
+            recall_limit: 每次召回条数上限
+            recall_char_budget: 召回内容总字符预算
+            consolidate_threshold: 触发整理的最小记录数
+        return: 无
+        """
         self.path = Path(path)
         self.max_records = max_records
         self.recall_limit = recall_limit
         self.recall_char_budget = recall_char_budget
         self.consolidate_threshold = consolidate_threshold
-        self.records: list[dict] = []  # {name, type, description, body, created_at}
+        self.records: list[dict] = []
         self.load()
 
-    # ---- 持久化 ----
-
     def load(self):
+        """从 JSON 文件加载记录，失败则置空。
+
+        paras: 无
+        return: 无
+        """
         if self.path.exists():
             try:
                 data = json.loads(self.path.read_text(encoding="utf-8"))
@@ -98,23 +96,36 @@ class AgentMemory:
                 self.records = []
 
     def save(self):
+        """把记录写回 JSON 文件（自动建父目录）。
+
+        paras: 无
+        return: 无
+        """
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(
             json.dumps(self.records, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
 
-    # ---- 目录与选择 ----
-
     def catalog(self) -> str:
-        """记忆目录文本（供召回 LLM 选择），格式 "序号: name - description" """
+        """生成记忆目录文本（供召回 LLM 选择）。
+
+        paras: 无
+        return: 逐行 "序号: name - description" 的文本
+        """
         return "\n".join(
             f"{i}: {r.get('name', '')} - {r.get('description', '')}"
             for i, r in enumerate(self.records)
         )
 
     def _keyword_select(self, query: str, max_items: int) -> list[int]:
-        """关键词匹配召回（LLM 失败时的降级路径）"""
+        """关键词匹配召回（LLM 选择失败时的降级路径）。
+
+        paras:
+            query: 任务文本
+            max_items: 最多返回条数
+        return: 命中的记录索引列表
+        """
         words = set(re.findall(r"[a-z0-9_]{3,}|[\u4e00-\u9fff]{2,}", query.lower()))
         scored = []
         for i, r in enumerate(self.records):
@@ -126,7 +137,13 @@ class AgentMemory:
         return [i for _, i in scored[:max_items]]
 
     def _select_indices(self, query: str, llm) -> list[int]:
-        """LLM 从目录中选出与任务相关的记忆索引，失败降级到关键词匹配"""
+        """LLM 从目录中选出相关记录索引，失败降级关键词匹配。
+
+        paras:
+            query: 任务文本
+            llm: LLM 实例
+        return: 去重后的记录索引列表（最多 recall_limit 条）
+        """
         if not self.records or not query.strip():
             return []
         prompt = (
@@ -154,10 +171,14 @@ class AgentMemory:
             logger.warning(f"记忆召回 LLM 选择失败，降级关键词匹配: {e}")
             return self._keyword_select(query, self.recall_limit)
 
-    # ---- 召回 ----
-
     def recall(self, query: str, llm) -> str:
-        """根据任务文本召回相关记忆，返回拼接文本（无相关记忆返回空串）"""
+        """按任务文本召回相关记忆并拼接。
+
+        paras:
+            query: 任务文本
+            llm: LLM 实例
+        return: "[type] name: body" 拼接文本；无相关记忆返回空串
+        """
         indices = self._select_indices(query, llm)
         if not indices:
             return ""
@@ -172,10 +193,13 @@ class AgentMemory:
             remaining -= len(clipped)
         return "\n\n".join(parts)
 
-    # ---- 提取 ----
-
     def _validate_candidate(self, record) -> dict | None:
-        """校验候选记录：字段完整 + type 合法 + scope=persistent + 非临时知识"""
+        """校验候选记录：字段完整 + type 合法 + scope=persistent + 非临时知识。
+
+        paras:
+            record: LLM 返回的候选记录 dict
+        return: 规范化后的记录；校验失败返回 None
+        """
         if not isinstance(record, dict):
             return None
         name = str(record.get("name", "")).strip()
@@ -187,7 +211,6 @@ class AgentMemory:
             return None
         if scope != "persistent":
             return None
-        # 临时标记黑名单：即使 LLM 错标 persistent，含临时语义的知识也不入库
         combined = f"{name}\n{description}\n{body}".lower()
         if any(marker in combined for marker in TEMPORARY_MEMORY_MARKERS):
             return None
@@ -195,7 +218,12 @@ class AgentMemory:
                 "description": description, "body": body}
 
     def _is_duplicate(self, candidate: dict) -> bool:
-        """与已有记录去重：slug / 归一化 description / 归一化 body 任一命中即重复"""
+        """判断候选记录是否与已有记录重复（slug / description / body 任一命中）。
+
+        paras:
+            candidate: 规范化后的候选记录
+        return: 重复返回 True
+        """
         slug = memory_slug(candidate["name"])
         norm_desc = _normalized_text(candidate["description"])
         norm_body = _normalized_text(candidate["body"])
@@ -209,7 +237,13 @@ class AgentMemory:
         return False
 
     def extract(self, dialogue: str, llm) -> int:
-        """从对话文本中提取可持久化知识并入库，返回新写入条数"""
+        """从对话中提取持久化知识入库（去重 + 超容量淘汰最老）。
+
+        paras:
+            dialogue: 对话文本
+            llm: LLM 实例
+        return: 新写入条数
+        """
         if not dialogue.strip():
             return 0
         existing = self.catalog() or "(无)"
@@ -245,7 +279,6 @@ class AgentMemory:
             stored += 1
 
         if stored:
-            # 超容量时淘汰最老的记录
             if len(self.records) > self.max_records:
                 self.records.sort(key=lambda r: r.get("created_at", ""))
                 self.records = self.records[-self.max_records:]
@@ -254,10 +287,13 @@ class AgentMemory:
                         extra={"event": "memory_extract", "stored": stored})
         return stored
 
-    # ---- 整理 ----
-
     def consolidate(self, llm) -> int:
-        """LLM 合并去重现有记忆，原子替换（失败回滚快照），返回合并后条数"""
+        """LLM 合并去重现有记忆，原子替换，失败回滚快照。
+
+        paras:
+            llm: LLM 实例
+        return: 合并后的记录条数；未达阈值或失败返回 0
+        """
         if len(self.records) < self.consolidate_threshold:
             return 0
         catalog = "\n\n".join(
@@ -293,7 +329,6 @@ class AgentMemory:
                         extra={"event": "memory_consolidate"})
             return len(merged)
         except Exception as e:
-            # 回滚快照
             try:
                 self.records = json.loads(snapshot)
                 self.save()
