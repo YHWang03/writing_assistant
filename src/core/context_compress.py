@@ -1,18 +1,18 @@
-"""上下文压缩 — 每次调用模型前按 s08 四步管线整理过长对话。
+"""上下文压缩 
 
-四步（低成本、可恢复的操作优先，只有最后一步调用模型）：
-  1. tool_result_budget：最新一批 tool_result 总字符超 20 万时，
+四步:
+  1. tool_result_budget: 最新一批 tool_result 总字符超 20 万时，
      最大的、超 3 万字符的结果完整落盘，上下文留路径 + 2000 字符预览
-  2. snip_compact：消息数超 50 条时，完整历史写入 .transcripts/，
+  2. snip_compact: 消息数超 50 条时，完整历史写入 .transcripts/
      只留最初 3 条 + 最近 46 条 + 归档标记（保护 tool_use/tool_result 配对）
-  3. micro_compact / fit_tool_results：已消费旧结果逐条落盘换成路径，
-     压到目标大小（阈值 80%）；仍超限时对全部结果按大小落盘留 1000 字符预览
-  4. compact_history：前三步后仍超阈值，一次 LLM 调用生成事实状态摘要
+  3. micro_compact / fit_tool_results: 已消费旧结果逐条落盘换成路径，
+     压到目标大小 阈值 80%；仍超限时对全部结果按大小落盘留 1000 字符预览
+  4. compact_history: 前三步后仍超阈值，一次 LLM 调用生成事实状态摘要
 
-阈值 = 上下文窗口的 80%（COMPACT_RATIO），整理目标 = 阈值的 80%（TARGET_RATIO）。
+阈值 = 上下文窗口的 80%(COMPACT_RATIO)，整理目标 = 阈值的 80%(TARGET_RATIO)
 落盘目录：.task_outputs/tool-results/（完整结果）与 .transcripts/（完整历史）。
 
-另含 reactive_compact：API 报上下文超限后的紧急压缩（摘要旧段 + 留最近 5 条，重试一次）。
+另含 reactive_compact: API 报上下文超限后的紧急压缩 摘要旧段 + 留最近 5 条，重试一次。
 """
 
 import json
@@ -180,7 +180,7 @@ def _tool_result_budget(messages: list[dict]) -> tuple[list, bool]:
 
 
 def _snip_compact(messages: list[dict]) -> tuple[list, bool]:
-    """步骤 2 — 消息数超 50 条时归档中段，留头 3 条 + 尾 46 条 + 归档标记。
+    """步骤 2 — 消息数超 50 条时归档中段，留头 3 条 + 尾 46 条 + 归档标记
 
     paras:
         messages: dict 消息列表
