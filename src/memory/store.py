@@ -12,6 +12,7 @@ from datetime import datetime
 from pathlib import Path
 
 from ..core.utils import extract_json_array
+from ..observability.telemetry import attributed
 
 logger = logging.getLogger(__name__)
 
@@ -171,6 +172,7 @@ class AgentMemory:
             logger.warning(f"记忆召回 LLM 选择失败，降级关键词匹配: {e}")
             return self._keyword_select(query, self.recall_limit)
 
+    @attributed("memory_recall")
     def recall(self, query: str, llm) -> str:
         """按任务文本召回相关记忆并拼接。
 
@@ -236,6 +238,7 @@ class AgentMemory:
                 return True
         return False
 
+    @attributed("memory_extract")
     def extract(self, dialogue: str, llm) -> int:
         """从对话中提取持久化知识入库（去重 + 超容量淘汰最老）。
 
@@ -287,6 +290,7 @@ class AgentMemory:
                         extra={"event": "memory_extract", "stored": stored})
         return stored
 
+    @attributed("memory_consolidate")
     def consolidate(self, llm) -> int:
         """LLM 合并去重现有记忆，原子替换，失败回滚快照。
 

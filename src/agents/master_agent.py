@@ -4,7 +4,6 @@ import logging
 from ..core.agent import Agent
 from ..core.llm import LLM
 from ..prompts import load_prompt
-from ..tools.registry import ToolRegistry
 from ..tools.builtin import ReadFileTool, ListFilesTool, DispatchTaskTool, ReadContextTool, FinishTool
 from ..hooks.builtin import MemoryRecallHook, MemoryExtractHook
 
@@ -13,6 +12,9 @@ logger = logging.getLogger(__name__)
 
 class MasterAgent(Agent):
     """主 Agent：路由协调，不直接处理论文内容"""
+
+    tool_types = (ReadFileTool, ListFilesTool, ReadContextTool, FinishTool)
+    hook_types = (MemoryRecallHook, MemoryExtractHook)
 
     def __init__(self, llm: LLM,
                  max_steps: int = 12, max_tokens: int = 8192,
@@ -33,35 +35,8 @@ class MasterAgent(Agent):
             run_mode=run_mode,
         )
         self.sub_agents: dict[str, Agent] = {}
-        self._setup_tools()
-        self._setup_hooks()
-
-    def _setup_tools(self):
-        """注册本 Agent 的工具集。
-
-        paras: 无
-        return: 无
-        """
-        self.tool_registry = ToolRegistry()
-        self.tool_registry.register(ReadFileTool())
-        self.tool_registry.register(ListFilesTool())
-
-        self._dispatch_tool = DispatchTaskTool(dispatch_func=self.dispatch)
-        self.tool_registry.register(self._dispatch_tool)
-
-        self._read_context = ReadContextTool()
-        self.tool_registry.register(self._read_context)
-
-        self.tool_registry.register(FinishTool())
-
-    def _setup_hooks(self):
-        """注册本 Agent 的 hooks（仅记忆召回与提取，本 Agent 不写产出文件）。
-
-        paras: 无
-        return: 无
-        """
-        self.hooks.register(MemoryRecallHook())
-        self.hooks.register(MemoryExtractHook())
+        self._setup_declared_components()
+        self.tool_registry.register(DispatchTaskTool(dispatch_func=self.dispatch))
 
     def register_sub_agent(self, name: str, agent: Agent):
         """注册子 Agent。
@@ -91,6 +66,7 @@ class MasterAgent(Agent):
             logger.info(f"{agent_name} completed.")
             return result
         except Exception as e:
+            logger.exception("%s execution failed", agent_name)
             return f"Error: {agent_name} 执行失败 — {e}"
 
     def _sync_context_to_tools(self):
@@ -100,10 +76,7 @@ class MasterAgent(Agent):
         return: 无
         """
         if self.context is not None:
-            try:
-                self._read_context.set_context(self.context)
-            except Exception:
-                pass
+            self.require_tool("read_context").set_context(self.context)
 
     def run(self, input_text: str) -> str:
         """主 Agent 运行入口，理解需求、分派任务并汇总结果。

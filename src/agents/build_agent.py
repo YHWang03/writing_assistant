@@ -3,21 +3,23 @@
 from ..core.agent import Agent
 from ..core.llm import LLM
 from ..prompts import load_prompt
-from ..tools.registry import ToolRegistry
 from ..tools.builtin import (
     DeleteFileTool, ReadFileTool, WriteFileTool, ListFilesTool,
     ValidateTemplateTool,
     CompileLatexTool, ParseLatexLogTool, ReadContextTool,
     FinishTool,
 )
-from ..hooks.builtin import (
-    MemoryRecallHook, DeadlineNudgeHook, CollectWrittenPathsHook,
-    FinishNudgeHook, OutputGateHook, MemoryExtractHook,
-)
+from ._common import STANDARD_HOOKS
 
 
 class BuildAgent(Agent):
     """构建 Agent：模板管理 + LaTeX 编译"""
+
+    tool_types = (
+        ReadFileTool, WriteFileTool, ListFilesTool, ValidateTemplateTool,
+        CompileLatexTool, ParseLatexLogTool, DeleteFileTool, ReadContextTool, FinishTool,
+    )
+    hook_types = STANDARD_HOOKS
 
     def __init__(self, llm: LLM, max_steps: int = 8, max_tokens: int = 8192,
                  run_mode: str = "react"):
@@ -36,41 +38,7 @@ class BuildAgent(Agent):
             max_steps=max_steps, max_tokens=max_tokens,
             run_mode=run_mode,
         )
-        self._setup_tools()
-        self._setup_hooks()
-
-    def _setup_tools(self):
-        """注册本 Agent 的工具集。
-
-        paras: 无
-        return: 无
-        """
-        self.tool_registry = ToolRegistry()
-        self.tool_registry.register(ReadFileTool())
-        write_file = WriteFileTool()
-        write_file.set_agent_name("BuildAgent")
-        self.tool_registry.register(write_file)
-        self.tool_registry.register(ListFilesTool())
-        self.tool_registry.register(ValidateTemplateTool())
-        self.tool_registry.register(CompileLatexTool())
-        self.tool_registry.register(ParseLatexLogTool())
-        self.tool_registry.register(DeleteFileTool())
-        self._read_context = ReadContextTool()
-        self.tool_registry.register(self._read_context)
-        self.tool_registry.register(FinishTool())
-
-    def _setup_hooks(self):
-        """注册本 Agent 的 hooks。
-
-        paras: 无
-        return: 无
-        """
-        self.hooks.register(MemoryRecallHook())
-        self.hooks.register(DeadlineNudgeHook())
-        self.hooks.register(CollectWrittenPathsHook())
-        self.hooks.register(FinishNudgeHook())
-        self.hooks.register(OutputGateHook())
-        self.hooks.register(MemoryExtractHook())
+        self._setup_declared_components()
 
     def _sync_context_to_tools(self):
         """将 context 注入到 ReadContextTool。
@@ -79,10 +47,7 @@ class BuildAgent(Agent):
         return: 无
         """
         if self.context is not None:
-            try:
-                self._read_context.set_context(self.context)
-            except Exception:
-                pass
+            self.require_tool("read_context").set_context(self.context)
 
     def run(self, input_text: str) -> str:
         """运行 BuildAgent 执行循环。

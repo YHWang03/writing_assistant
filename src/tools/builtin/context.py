@@ -1,6 +1,7 @@
 """上下文工具 — Agent 主动读取 PaperContext 数据。"""
 
 import json as json_mod
+from collections.abc import Mapping, Sequence
 
 from ..base import Tool
 
@@ -67,7 +68,7 @@ class ReadContextTool(Tool):
                 ]
                 return "\n".join(lines)
 
-            value = getattr(self._context_view, field)
+            value = self._context_view.read(field)
             return self._format_field_value(field, value)
         except Exception as e:
             return f"Error: 读取上下文失败 — {e}"
@@ -91,12 +92,12 @@ class ReadContextTool(Tool):
         if isinstance(value, bool):
             return f"{field}: {value}"
 
-        if isinstance(value, dict):
+        if isinstance(value, Mapping):
             if not value:
                 return f"{field}: (空字典)"
-            return f"{field}:\n{json_mod.dumps(value, ensure_ascii=False, indent=2)}"
+            return f"{field}:\n{json_mod.dumps(dict(value), ensure_ascii=False, indent=2)}"
 
-        if isinstance(value, list):
+        if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
             if not value:
                 return f"{field}: (空列表)"
 

@@ -14,6 +14,6 @@ def safe_resolve(file_path: str) -> Path:
     return: 解析后的绝对 Path；越界抛 ValueError
     """
     path = Path(file_path).resolve()
-    if not str(path).startswith(str(_PROJECT_ROOT.resolve())):
+    if not path.is_relative_to(_PROJECT_ROOT.resolve()):
         raise ValueError(f"路径越界: {file_path}（仅允许操作项目目录内的文件）")
     return path

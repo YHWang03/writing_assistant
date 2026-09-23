@@ -215,10 +215,12 @@ class WriteFileTool(Tool):
         except ValueError as e:
             return f"Error: {e}"
 
-        if path.suffix == ".bib" and self._agent_name != "LiteratureAgent":
+        if path.name.lower() in ("citation_evidence.json", "citation_report.txt"):
+            return "Error: 引用报告由 validate_all_citations 自动生成，禁止手写覆盖证据等级；请重新核查。"
+        if path.suffix.lower() == ".bib" or path.name.lower() == "reference_library.json":
             return (
-                "Error: 只有 LiteratureAgent 可以写入 .bib 文件。\n"
-                "请将缺失的文献信息报告给 MasterAgent，由 MasterAgent 调度 LiteratureAgent 处理。"
+                "Error: 文献文件必须通过结构化文献命令维护。\n"
+                "请由 LiteratureAgent 使用 add_reference/update_reference/remove_reference，随后导出 bib。"
             )
 
         try:

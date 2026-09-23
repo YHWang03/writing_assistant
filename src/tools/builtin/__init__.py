@@ -2,11 +2,10 @@
 
 from .pdf import ParsePDFTool, GetPaperTextTool, ParseAndStoreTool
 from .search import SearchPapersTool, VerifyPaperTool
-from .bib import (
-    GenerateBibtexTool, SummarizePaperTool, ScanCitationsTool,
-    LookupPaperInfoTool, CompareCitationTool, ValidateAllCitationsTool,
-    WriteBibFileTool, AddReferenceTool, ListCiteKeysTool, GenerateBibFromRefLibTool,
-)
+from .citations.generation import GenerateBibtexTool, SummarizePaperTool, GenerateBibFromRefLibTool
+from .citations.lookup import ScanCitationsTool, LookupPaperInfoTool, ListCiteKeysTool
+from .citations.validation import CompareCitationTool, ValidateAllCitationsTool
+from .citations.storage import WriteBibFileTool, AddReferenceTool
 from .tex import DeleteFileTool, ReadFileTool, WriteFileTool, ListFilesTool
 from .template import ValidateTemplateTool
 from .compile import CompileLatexTool, ParseLatexLogTool

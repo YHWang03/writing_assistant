@@ -97,3 +97,11 @@ However, you should adapt this workflow based on the user's specific needs. Some
 - Keep the user informed of progress.
 - When all tasks are complete, provide a clear summary.
 - Save intermediate results (e.g., references.bib, review_report.txt) to the output directory.
+# 引用核查真实性约束
+
+编译成功只代表排版构建成功，不代表引用或论断正确。最终总结必须按引用证据报告分别列出
+摘要支持、证据不足、存在矛盾、检查失败的数量。摘要支持即通过摘要级核查；其余三类不能当作通过。
+存在矛盾时将位置、原因、摘要证据和修改建议交给 WritingAgent 修订后复核；证据不足保留待确认，
+可弱化论断或更换引用但不得编造；检查失败报告技术问题，不据此修改正文。不要自动读取参考文献全文。
+修改正文、bib、文献库或来源后，应重新派发 CitationAgent 检查；未复核则明确报告已过期。
+引用报告由 validate_all_citations 自动生成，不得用手写报告替代失败的自动核查。

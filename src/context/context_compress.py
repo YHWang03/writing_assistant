@@ -22,7 +22,8 @@ import uuid
 from collections import Counter
 from pathlib import Path
 
-from .message import Message
+from ..core.message import Message
+from ..observability.telemetry import attributed
 from .token_counter import estimate_tokens
 
 logger = logging.getLogger(__name__)
@@ -357,6 +358,7 @@ def _fallback_summary(text: str) -> str:
     return "[规则兜底摘要]\n" + "\n".join(parts) if parts else "[规则兜底摘要] 无可用信息"
 
 
+@attributed("compression")
 def _call_summary_llm(llm, content_text: str, agent_name: str) -> str:
     """调用 LLM 生成事实状态摘要，失败回退规则兜底。
 
@@ -457,11 +459,17 @@ def compress_messages(messages: list[dict], keep_recent: int, context_window: in
     if estimated > threshold:
         messages, did = _micro_compact(messages, target)
         changed = changed or did
-        estimated = estimate_tokens(messages)
+        # API usage includes system prompts and tool schemas that are absent from
+        # ``messages``.  Keep the API anchor until a compaction step actually
+        # changes the messages; otherwise a tiny local estimate can incorrectly
+        # cancel compression that the real usage already proved necessary.
+        if did:
+            estimated = estimate_tokens(messages)
         if estimated > threshold:
             messages, did = _fit_tool_results(messages, target)
             changed = changed or did
-            estimated = estimate_tokens(messages)
+            if did:
+                estimated = estimate_tokens(messages)
         if estimated > threshold:
             messages, did = _compact_to_summary(
                 messages, llm, agent_name, keep_recent, "上下文摘要")

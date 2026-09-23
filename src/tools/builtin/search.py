@@ -295,6 +295,17 @@ class SearchPapersTool(Tool):
 
     def execute(self, query: str, max_results: int = 5,
                 backend: str = "auto") -> str:
+        result = self._execute_search(query, max_results, backend)
+        provenance = getattr(self, "provenance", None)
+        if provenance is not None:
+            obj = json_mod.loads(result)
+            if obj.get("ok"):
+                for paper in obj.get("results", []):
+                    provenance.record(paper.get("title", ""), "search")
+        return result
+
+    def _execute_search(self, query: str, max_results: int = 5,
+                        backend: str = "auto") -> str:
         """在线搜索论文。
 
         paras:
@@ -540,7 +551,8 @@ class VerifyPaperTool(Tool):
     def __init__(self):
         super().__init__(
             name="verify_paper",
-            description="验证论文是否真实存在（OpenAlex → Semantic Scholar → arXiv 依次查询）。"
+            description="仅对模型凭记忆提出的文献搜索验证：规范化标题一致即通过。"
+                        "用户PDF不验证存在性；已有搜索结果不重复验证。通过不代表其他元数据或引用论断正确。"
         )
         self._searcher = SearchPapersTool()
 
@@ -553,37 +565,49 @@ class VerifyPaperTool(Tool):
             "type": "object",
             "properties": {
                 "title": {"type": "string", "description": "论文标题"},
-                "authors": {"type": "string", "description": "第一作者姓名（可选）"},
             },
             "required": ["title"],
         }
 
-    def execute(self, title: str, authors: str = "") -> str:
-        """验证论文是否真实存在。
+    def execute(self, title: str, authors: str = "", year: int = 0, doi: str = "") -> str:
+        """只核对标题；authors/year/doi 仅为兼容旧调用保留，不参与判定。"""
+        import unicodedata
 
-        paras:
-            title: 论文标题
-            authors: 第一作者姓名（可选）
-        return: JSON 字符串 {"verified": bool, ...}，命中时含论文元数据
-        """
+        def normalize(value):
+            value = unicodedata.normalize("NFKD", str(value)).casefold()
+            return " ".join(re.findall(r"[^\W_]+", "".join(c for c in value if not unicodedata.combining(c))))
+
+        def answer(status, reason, **extra):
+            return json_mod.dumps({"verified": status == "matched", "status": status,
+                                   "reason": reason, **extra}, ensure_ascii=False)
+
+        if not normalize(title):
+            return answer("invalid_input", "标题不能为空")
+        provenance = getattr(self, "provenance", None)
+        if provenance is not None and provenance.lookup(title):
+            return json_mod.dumps({"verified": provenance.lookup(title) == "verified_title",
+                                   "status": "not_required", "network_called": False,
+                                   "reason": "已有PDF/搜索来源或标题验证凭据，不重复联网"}, ensure_ascii=False)
         try:
-            obj = json_mod.loads(self._searcher._search_auto(title, 1))
-        except Exception as e:
-            return json_mod.dumps({"verified": False, "reason": f"验证失败: {e}"})
-
+            obj = json_mod.loads(self._searcher._search_auto(title, 5))
+        except Exception as exc:
+            return answer("search_failed", f"检索失败，不能据此判定文献不存在: {exc}")
         if not obj.get("ok"):
-            return json_mod.dumps({"verified": False,
-                                   "reason": obj.get("error") or "未找到匹配论文"})
+            return answer("search_failed", obj.get("error") or "检索未成功")
         papers = obj.get("results", [])
         if not papers:
-            return json_mod.dumps({"verified": False, "reason": "未找到匹配论文"})
+            return answer("not_found", "本次检索未找到候选，不代表文献不存在")
 
-        p = papers[0]
-        return json_mod.dumps({
-            "verified": True,
-            "title": p.get("title", ""),
-            "authors": p.get("authors", ""),
-            "year": p.get("year", 0),
-            "abstract": p.get("abstract", ""),
-            "doi": p.get("doi", ""),
-        }, ensure_ascii=False)
+        matches = [paper for paper in papers
+                   if isinstance(paper, dict) and normalize(paper.get("title", "")) == normalize(title)]
+        if not matches:
+            return answer("unconfirmed", "本次候选中没有标题一致的文献，不代表文献不存在",
+                          candidates=papers, backend=obj.get("backend"), checked_fields=["title"])
+        # 同名多版本也通过标题存在性检查，但不自动选定其中一个版本的元数据。
+        metadata = ({k: matches[0].get(k, "") for k in ("title", "authors", "year", "abstract", "doi")}
+                    if len(matches) == 1 else {"title": title})
+        if provenance is not None:
+            provenance.record(title, "verified_title")
+        return answer("matched", "检索到同名文献；仅核对标题，未验证作者、年份、DOI或正文论断",
+                      **metadata, candidates=matches, match_count=len(matches),
+                      backend=obj.get("backend"), checked_fields=["title"])

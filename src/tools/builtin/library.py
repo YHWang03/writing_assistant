@@ -5,8 +5,8 @@ import re
 from pathlib import Path
 
 from ..base import Tool
-from ...core.paper import Paper
-from ...core.library import load_library, save_library
+from ...domain.paper import Paper
+from ...domain.library import load_library, save_library
 from ...core.llm import get_tool_llm
 
 
@@ -261,6 +261,11 @@ class WriteLibraryTool(Tool):
         )
         self._library_path = ""
         self._reference_library: list[Paper] = []
+        self._reference_provider = None
+
+    def set_reference_provider(self, provider):
+        """Query an authorized snapshot when the tool executes."""
+        self._reference_provider = provider
 
     def set_library_path(self, path: str):
         """注入持久文献库路径。
@@ -293,7 +298,9 @@ class WriteLibraryTool(Tool):
         if not self._library_path:
             return json_mod.dumps({"error": "write_library 未注入文献库路径"})
         before_keys = {p.cite_key for p in load_library(self._library_path) if p.cite_key}
-        merged = save_library(self._library_path, self._reference_library)
+        references = (self._reference_provider() if self._reference_provider is not None
+                      else self._reference_library)
+        merged = save_library(self._library_path, references, replace=True)
         added = sum(1 for p in merged if p.cite_key and p.cite_key not in before_keys)
         return json_mod.dumps({
             "status": "ok",

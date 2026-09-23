@@ -1,11 +1,15 @@
 """持久文献库 — reference_library 的 JSON 落盘/读取，跨任务累积，按 cite_key 去重合并"""
 
 import json as json_mod
+import logging
 from pathlib import Path
+import os
+import tempfile
 
 from .paper import Paper, Source
 
 LIBRARY_FILENAME = "reference_library.json"
+logger = logging.getLogger(__name__)
 
 
 def _library_file(dir_path: str) -> Path:
@@ -32,7 +36,8 @@ def load_library(path: str) -> list[Paper]:
         return []
     try:
         data = json_mod.loads(p.read_text(encoding="utf-8"))
-    except Exception:
+    except (OSError, UnicodeError, json_mod.JSONDecodeError) as exc:
+        logger.warning("文献库读取失败 %s: %s", p, exc)
         return []
     if not isinstance(data, list):
         return []
@@ -42,26 +47,42 @@ def load_library(path: str) -> list[Paper]:
             continue
         try:
             papers.append(_paper_from_dict(item))
-        except Exception:
+        except (KeyError, TypeError, ValueError) as exc:
+            logger.warning("跳过无效文献记录: %s", exc)
             continue
     return papers
 
 
-def save_library(path: str, papers: list[Paper]) -> list[Paper]:
-    """把 papers 合并进现有库（按 cite_key 去重，幂等）后写回。
+def save_library(path: str, papers: list[Paper], *, replace: bool = False) -> list[Paper]:
+    """保存文献。默认传入记录覆盖同名旧记录；replace=True 保存完整快照（含删除）。
 
     paras:
         path: 文献库目录
         papers: 要合入的 Paper 列表
     return: 合并后的完整 Paper 列表
     """
-    existing = load_library(path)
-    merged = merge_papers(existing, papers)
+    existing = [] if replace else load_library(path)
+    merged = merge_papers(papers, existing)
     p = _library_file(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     data = [paper.to_dict() for paper in merged]
-    p.write_text(json_mod.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write(p, json_mod.dumps(data, ensure_ascii=False, indent=2))
     return merged
+
+
+def atomic_write(path: Path, text: str):
+    """单文件原子替换，避免中断留下半份文献库。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    name = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         delete=False) as stream:
+            name = stream.name
+            stream.write(text)
+        os.replace(name, path)
+    finally:
+        if name and Path(name).exists():
+            Path(name).unlink()
 
 
 def merge_papers(*paper_lists) -> list[Paper]:
@@ -118,4 +139,10 @@ def _paper_from_dict(d: dict) -> Paper:
         publisher=d.get("publisher", ""),
         arxiv_id=d.get("arxiv_id", ""),
         keywords=list(d.get("keywords") or []),
+        entry_type=d.get("entry_type", "article"),
+        bib_fields=dict(d.get("bib_fields") or {}),
+        source_pdf=d.get("source_pdf", ""),
+        source_fingerprint=d.get("source_fingerprint", ""),
+        provenance_kind=d.get("provenance_kind", ""),
+        provenance_title=d.get("provenance_title", ""),
     )

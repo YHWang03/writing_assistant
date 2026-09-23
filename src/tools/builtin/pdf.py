@@ -1,24 +1,30 @@
 """PDF 解析工具 — 元数据提取（单篇/批量并行）与原文获取。"""
 
 import html
+import logging
 import json as json_mod
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from ...observability.telemetry import submit_with_context
 from pathlib import Path
 from ..base import Tool
 from ...core.llm import get_tool_llm
 from ._cite_key import make_cite_key
+from ...context.pdf_cache import PDFCache
+from ...core.llm import IncompleteResponseError
+from anthropic import APIConnectionError, APIStatusError
 
 
 class ParsePDFTool(Tool):
     """解析 PDF 提取元数据，支持单篇与批量并行"""
 
-    def __init__(self):
+    def __init__(self, cache_dir=None):
         super().__init__(
             name="parse_pdf",
             description="解析 PDF 论文，提取标题、作者、摘要、正文等信息。"
                         "支持单篇（pdf_path）和批量并行（pdf_paths 传入列表）。"
                         "批量模式下，多个 PDF 并发处理，大幅提升效率。"
         )
+        self._cache = PDFCache(cache_dir)
 
     def get_parameters(self) -> dict:
         """返回工具参数的 JSON Schema 定义。
@@ -65,50 +71,7 @@ class ParsePDFTool(Tool):
         return json_mod.dumps({"error": "请提供 pdf_path 或 pdf_paths 参数"})
 
     def _parse_single(self, pdf_path: str) -> str:
-        """解析单篇 PDF，LLM 解析失败时返回 fallback 指示。
-
-        paras:
-            pdf_path: PDF 文件路径
-        return: JSON 字符串（元数据或 fallback 指示）
-        """
-        path = Path(pdf_path)
-        if not path.exists():
-            return json_mod.dumps({"error": f"文件不存在: {pdf_path}", "file": pdf_path})
-
-        try:
-            import fitz
-            doc = fitz.open(str(path))
-            full_text = ""
-            for page in doc:
-                full_text += page.get_text()
-            doc.close()
-        except ImportError:
-            return json_mod.dumps({"error": "PyMuPDF 未安装", "file": pdf_path})
-        except Exception as e:
-            return json_mod.dumps({"error": f"PDF 解析失败: {e}", "file": pdf_path})
-
-        if not full_text.strip():
-            return json_mod.dumps({"error": "PDF 内容为空", "file": pdf_path})
-
-        result = self._extract_with_llm(full_text[:3000], pdf_path)
-        try:
-            parsed = json_mod.loads(result)
-            if "error" in parsed:
-                return json_mod.dumps({
-                    "fallback": "get_paper_text",
-                    "message": "parse_pdf 的 LLM 解析失败，已自动 fallback 到 get_paper_text",
-                    "text": full_text[:50000],
-                    "file": pdf_path,
-                }, ensure_ascii=False)
-            parsed["file"] = pdf_path
-            return json_mod.dumps(parsed, ensure_ascii=False)
-        except json_mod.JSONDecodeError:
-            return json_mod.dumps({
-                "fallback": "get_paper_text",
-                "message": "parse_pdf 的 LLM 解析失败（返回非 JSON），已自动 fallback 到 get_paper_text",
-                "text": full_text[:50000],
-                "file": pdf_path,
-            }, ensure_ascii=False)
+        return json_mod.dumps(self._parse_one_worker(pdf_path), ensure_ascii=False)
 
     def _parse_batch(self, pdf_paths: list[str], max_workers: int) -> str:
         """并行解析多篇 PDF。
@@ -120,11 +83,11 @@ class ParsePDFTool(Tool):
         """
         results = []
         errors = []
-        workers = min(max_workers, len(pdf_paths))
+        workers = max(1, min(max_workers, len(pdf_paths), 8))
 
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {
-                executor.submit(self._parse_one_worker, p): p
+                submit_with_context(executor, self._parse_one_worker, p): p
                 for p in pdf_paths
             }
             for future in as_completed(futures):
@@ -150,38 +113,80 @@ class ParsePDFTool(Tool):
         return json_mod.dumps(output, ensure_ascii=False, indent=2)
 
     def _parse_one_worker(self, pdf_path: str) -> dict:
-        """单 worker 解析一篇 PDF（提取文本 + LLM 提取元数据）。
-
-        paras:
-            pdf_path: PDF 文件路径
-        return: 元数据 dict；失败返回含 error 的 dict
-        """
+        """单篇/批量共用：指纹缓存、失败分类、最多两次临时错误尝试。"""
         path = Path(pdf_path)
-        if not path.exists():
-            return {"error": f"文件不存在: {pdf_path}", "file": pdf_path}
-
         try:
-            import fitz
-            doc = fitz.open(str(path))
-            full_text = ""
-            for page in doc:
-                full_text += page.get_text()
-            doc.close()
-        except ImportError:
-            return {"error": "PyMuPDF 未安装", "file": pdf_path}
-        except Exception as e:
-            return {"error": f"PDF 解析失败: {e}", "file": pdf_path}
+            content = path.read_bytes()
+        except OSError as exc:
+            return {"status": "failed", "error": str(exc), "error_kind": "file_unavailable",
+                    "file": pdf_path, "attempts": 0, "cache_hit": False, "retryable": False}
+        key = self._cache.key(content)
+        with self._cache.lock(key):
+            cached = self._cache.read(key)
+            if cached and cached.get("status") == "success" and ParseAndStoreTool._missing_fields(cached):
+                cached = None
+            if cached:
+                cached.update(file=pdf_path, cache_hit=True)
+                self._log_result(cached)
+                return cached
+            result = {"fingerprint": key, "file": pdf_path, "status": "failed",
+                      "cache_hit": False, "attempts": 0, "retryable": False}
+            try:
+                import fitz
+                with fitz.open(stream=content, filetype="pdf") as doc:
+                    if doc.needs_pass:
+                        raise ValueError("PDF 已加密，需要密码")
+                    full_text = "".join(page.get_text() for page in doc)
+            except Exception as exc:
+                result.update(error=f"PDF 读取失败: {exc}", error_kind="pdf_unreadable")
+            else:
+                if not full_text.strip():
+                    result.update(error="PDF 无可提取文本，可能需要 OCR", error_kind="empty_text")
+                else:
+                    for attempt in range(1, 3):
+                        result["attempts"] = attempt
+                        extracted = self._extract_with_llm(full_text[:3000], pdf_path)
+                        try:
+                            parsed = json_mod.loads(extracted)
+                            if not isinstance(parsed, dict):
+                                raise ValueError("元数据必须为对象")
+                            if "error" in parsed:
+                                result.update(error=parsed["error"],
+                                              error_kind=parsed.get("error_kind", "llm_error"),
+                                              retryable=parsed.get("retryable", False))
+                                if result["retryable"] and attempt < 2:
+                                    continue
+                                break
+                            missing = ParseAndStoreTool._missing_fields(parsed)
+                            if missing:
+                                raise ValueError("缺失或无效字段: " + ", ".join(missing))
+                            # 只接受书目字段，避免模型覆盖状态/指纹。
+                            names = ("title", "authors", "year", "journal", "volume",
+                                     "number", "pages", "doi", "abstract", "keywords")
+                            result.update({name: parsed[name] for name in names if name in parsed})
+                            result.pop("error", None)
+                            result.pop("error_kind", None)
+                            result.update(status="success", retryable=False)
+                        except (ValueError, TypeError) as exc:
+                            result.update(error=f"元数据解析失败: {exc}",
+                                          error_kind="invalid_metadata", retryable=False)
+                        break
+            if result["status"] == "failed":
+                result["retry_exhausted"] = bool(result["retryable"])
+                result["next_action"] = "本进程不再重复解析；请补充元数据或修复问题后重启。"
+            try:
+                self._cache.write(key, result)
+            except OSError as exc:
+                result["cache_warning"] = f"缓存保存失败: {exc}"
+            self._log_result(result)
+            return result
 
-        if not full_text.strip():
-            return {"error": "PDF 内容为空", "file": pdf_path}
-
-        result = self._extract_with_llm(full_text[:3000], pdf_path)
-        try:
-            parsed = json_mod.loads(result)
-            parsed["file"] = pdf_path
-            return parsed
-        except json_mod.JSONDecodeError:
-            return {"error": "LLM 返回非 JSON", "file": pdf_path, "raw": result[:200]}
+    @staticmethod
+    def _log_result(result):
+        fields = {k: result[k] for k in ("file", "fingerprint", "status", "attempts",
+                  "cache_hit", "error_kind", "retry_exhausted") if k in result}
+        logging.getLogger(__name__).info("PDF parse %s", fields,
+                                        extra={"event": "pdf_parse", **fields})
 
     def _extract_with_llm(self, text: str, pdf_path: str = "") -> str:
         """用 LLM 从 PDF 文本中提取论文元数据。
@@ -207,11 +212,20 @@ class ParsePDFTool(Tool):
             if result.startswith("```"):
                 lines = result.split("\n")
                 result = "\n".join(lines[1:-1])
-            # LLM 可能输出 HTML 实体（如 &amp;），解码还原为原始字符
-            result = html.unescape(result)
+            # JSON 解析后再解码实体，避免 &quot; 破坏 JSON 字符串边界。
+            parsed = json_mod.loads(result)
+            if isinstance(parsed, dict):
+                parsed = {k: html.unescape(v) if isinstance(v, str) else v for k, v in parsed.items()}
+            result = json_mod.dumps(parsed, ensure_ascii=False)
             return result
+        except IncompleteResponseError as e:
+            return json_mod.dumps({"error": str(e), "error_kind": "incomplete_output", "retryable": False})
         except Exception as e:
-            return json_mod.dumps({"error": f"LLM 提取失败: {e}", "file": pdf_path})
+            transient = isinstance(e, APIConnectionError) or (
+                isinstance(e, APIStatusError) and (e.status_code in (408, 409, 429) or e.status_code >= 500))
+            return json_mod.dumps({"error": f"LLM 提取失败: {e}", "file": pdf_path,
+                                   "error_kind": "transient_api" if transient else "extraction_failed",
+                                   "retryable": transient})
 
 
 class ParseAndStoreTool(Tool):
@@ -226,8 +240,6 @@ class ParseAndStoreTool(Tool):
         )
         self._parse_tool = ParsePDFTool()
         self._add_func = None
-        # 已成功入库的 PDF 路径（跨 dispatch 保留）；失败不记录以允许重试
-        self._attempted_files: set[str] = set()
 
     def set_add_func(self, add_func):
         """注入入库回调（context.add_reference）。
@@ -278,14 +290,17 @@ class ParseAndStoreTool(Tool):
             return json_mod.dumps({"error": "parse_and_store 工具未注入上下文"})
 
         files = [pdf_path] if pdf_path else list(pdf_paths or [])
-        new_files = [f for f in files if f not in self._attempted_files]
-        skipped = [f for f in files if f in self._attempted_files]
+        new_files = list(dict.fromkeys(files))
+        allowed = getattr(self, "allowed_pdf_paths", None)
+        if allowed is not None and any(str(Path(p).resolve()) not in allowed for p in new_files):
+            return "Error: PDF不在用户配置的输入列表中，不能作为用户来源导入"
+        skipped = []
 
         if not new_files:
             return json_mod.dumps({
                 "stored": 0, "failed": 0, "skipped": len(skipped),
                 "skipped_files": skipped,
-                "note": "所有传入文件均已处理过，已跳过（避免重复解析）。请直接调用 generate_bib_from_ref_library 生成 .bib。",
+                "note": "请提供 pdf_path 或 pdf_paths。",
             }, ensure_ascii=False)
 
         raw = self._parse_tool.execute(
@@ -312,11 +327,7 @@ class ParseAndStoreTool(Tool):
                 "reason": "LLM 解析失败，fallback 到原始文本，未入库",
             }, ensure_ascii=False)
         elif isinstance(data, dict) and "error" in data:
-            return json_mod.dumps({
-                "stored": 0, "failed": 1,
-                "failed_files": [data.get("file", "")],
-                "reason": data["error"],
-            }, ensure_ascii=False)
+            papers, errors = [], [data]
         else:
             papers = []
             errors = []
@@ -345,7 +356,7 @@ class ParseAndStoreTool(Tool):
                 p.get("authors", ""), p.get("year", 0) or 0, p.get("title", "")
             )
             try:
-                from ...core.paper import Paper, Source
+                from ...domain.paper import Paper, Source
                 ref = Paper(
                     cite_key=cite_key,
                     title=p.get("title", ""),
@@ -359,11 +370,17 @@ class ParseAndStoreTool(Tool):
                     pages=p.get("pages", ""),
                     doi=p.get("doi", ""),
                     keywords=p.get("keywords", []),
+                    source_pdf=str(Path(p.get("file", "")).resolve()),
+                    source_fingerprint=p.get("fingerprint", ""),
                 )
+                from ...domain.reference_provenance import title_key
+                ref.provenance_kind = "pdf"
+                ref.provenance_title = title_key(ref.title)
+                provenance = getattr(self, "provenance", None)
+                if provenance is not None:
+                    provenance.record(ref.title, "pdf")
                 self._add_func(ref)
                 stored_keys.append(cite_key)
-                if p.get("file"):
-                    self._attempted_files.add(p["file"])
             except Exception as e:
                 failed_files.append(p.get("file", cite_key or "unknown"))
                 failures.append({
@@ -375,11 +392,17 @@ class ParseAndStoreTool(Tool):
             file = e.get("file", "unknown")
             failed_files.append(file)
             failures.append({
+                **{k: e[k] for k in ("error_kind", "attempts", "cache_hit", "retryable",
+                                      "retry_exhausted", "next_action") if k in e},
                 "file": file,
                 "reason": e.get("error", "解析失败"),
             })
 
         output = {
+            "cached": sum(bool(p.get("cache_hit")) for p in papers + errors),
+            "files": [{k: p[k] for k in ("file", "status", "fingerprint", "attempts",
+                       "cache_hit", "error_kind", "retry_exhausted", "cache_warning") if k in p}
+                      for p in papers + errors],
             "stored": len(stored_keys),
             "stored_keys": stored_keys,
             "failed": len(failed_files),
@@ -400,7 +423,18 @@ class ParseAndStoreTool(Tool):
             p: 单篇解析结果 dict
         return: 缺失字段名列表；journal 不作为必备字段（预印本首页常无期刊名，缺失不应丢弃整条文献）
         """
-        return [f for f in ("title", "authors", "year") if not p.get(f)]
+        missing = [f for f in ("title", "authors")
+                   if not isinstance(p.get(f), str) or not p[f].strip()]
+        year = p.get("year")
+        if not isinstance(year, int) or isinstance(year, bool) or year <= 0:
+            missing.append("year")
+        for key in ("journal", "volume", "number", "pages", "doi", "abstract"):
+            if key in p and not isinstance(p[key], str):
+                missing.append(key)
+        if "keywords" in p and (not isinstance(p["keywords"], list)
+                               or not all(isinstance(k, str) for k in p["keywords"])):
+            missing.append("keywords")
+        return missing
 
 
 class GetPaperTextTool(Tool):

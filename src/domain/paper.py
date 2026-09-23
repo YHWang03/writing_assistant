@@ -32,6 +32,12 @@ class Paper:
     publisher: str = ""
     arxiv_id: str = ""
     keywords: list[str] = field(default_factory=list)
+    entry_type: str = "article"
+    bib_fields: dict[str, str] = field(default_factory=dict)
+    source_pdf: str = ""
+    source_fingerprint: str = ""
+    provenance_kind: str = ""
+    provenance_title: str = ""
 
     def to_dict(self) -> dict:
         """转为 dict。

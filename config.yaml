@@ -57,6 +57,14 @@ agents:
 # === 记忆配置 ===
 # 每个 Agent 一份独立的长期记忆（JSON），由 harness 在任务边界自动召回/提取
 memory:
+  # 长期记忆独立开关；修改后重启生效，不影响当前对话历史和文献库
+  enabled:
+    master: true
+    literature: false
+    writing: false
+    citation: false
+    review: false
+    build: false
   path: "memory/{agent_name}.json"   # 记忆文件路径模板（按 Agent 命名）
   max_records: 200                   # 每个 Agent 记忆最大条数（超出淘汰最老记录）
   recall_limit: 5                    # 每次任务入口召回的相关记忆条数上限

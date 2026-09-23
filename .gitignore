@@ -15,6 +15,7 @@ logs/
 memory/*.json
 .transcripts/
 .task_outputs/
+.cache/pdf_metadata/
 
 # ===== example/：仅上传空目录结构，具体文件一律不上传 =====
 /example/**
@@ -22,6 +23,5 @@ memory/*.json
 !/example/**/.gitkeep
 
 # ===== 按要求不上传的内容 =====
-tests/
 note.md
 PROJECT_LOG.md

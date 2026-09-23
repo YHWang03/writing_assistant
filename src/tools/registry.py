@@ -53,12 +53,14 @@ class ToolRegistry:
             try:
                 return self._tools[name].execute(**params)
             except Exception as e:
+                logger.exception("Tool '%s' failed", name)
                 return f"Error: tool '{name}' failed — {e}"
 
         if name in self._functions:
             try:
                 return self._functions[name]["func"](**params)
             except Exception as e:
+                logger.exception("Tool function '%s' failed", name)
                 return f"Error: tool '{name}' failed — {e}"
 
         return f"Error: unknown tool '{name}'."

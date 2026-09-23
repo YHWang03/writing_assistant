@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>写作助手 · 调用报告</title>
+<style>
+:root{color-scheme:light;font-family:system-ui,-apple-system,"Microsoft YaHei",sans-serif;color:#192b43;background:#f3f6fa}
+body{margin:0}main{max-width:1440px;margin:auto;padding:32px}a{color:#265cb1}h1{margin:12px 0;font-size:30px}h2{font-size:19px}p,.muted{color:#576981;line-height:1.7}
+.panel{background:white;border:1px solid #dfe6ef;border-radius:14px;padding:20px;margin:20px 0}.filters,.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(165px,1fr));gap:12px}
+label{display:flex;flex-direction:column;gap:6px;font-size:13px}select,input,button{font:inherit;border:1px solid #c4d0df;border-radius:6px;padding:9px;background:white;color:inherit;min-width:0}button{cursor:pointer}button:hover{background:#edf3fc}button:disabled{opacity:.45;cursor:default}
+.card{background:#fff;border:1px solid #dfe6ef;border-radius:12px;padding:18px}.card strong{display:block;font-size:25px;margin:9px 0}.card small{color:#60738c}.scroll{overflow:auto}table{border-collapse:collapse;width:100%;font-size:13px}td,th{text-align:left;padding:11px;border-bottom:1px solid #e7ecf3;vertical-align:top;white-space:nowrap}th{color:#526782}pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px;max-width:1000px}details{min-width:100px}.bad{color:#ad3542}.toolbar{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.bar{height:4px;background:#5584ce;border-radius:4px;max-width:220px;margin-top:5px}#tasks{overflow-wrap:anywhere}noscript{color:#ad3542}@media(max-width:650px){main{padding:16px}h1{font-size:24px}}
+</style></head>
+<body><main><a href="../index.html">← 所有运行</a><h1 id="title">模型调用报告</h1>
+<p id="meta"></p><p>统计仅使用 API 已知用量；缓存字段单独统计，不与输入相加。SDK 内部自动重试的独立用量不可见。时间按浏览器本地时区显示。</p>
+<noscript>请启用 JavaScript 以查看和筛选本地报告。</noscript>
+<section class="panel"><div class="filters" id="filters"></div><div class="toolbar" style="margin-top:14px"><button id="reset">清除筛选</button><span id="count"></span></div></section>
+<section class="cards" id="cards"></section>
+<section class="panel"><h2>任务状态</h2><div id="tasks"></div></section>
+<section class="panel"><div class="toolbar"><h2>消耗排名</h2><label>分组<select id="group"><option value="agent">Agent</option><option value="model">模型</option><option value="tool">工具</option><option value="purpose">用途</option></select></label></div><div class="scroll"><table><thead><tr><th>分组</th><th>调用</th><th>已知输入</th><th>已知输出</th><th>失败</th><th>调用累计耗时 / 秒</th></tr></thead><tbody id="ranking"></tbody></table></div></section>
+<section class="panel"><h2>调用耗时分布</h2><div id="durations" class="cards"></div><p class="muted">累计耗时可包含并行调用重叠时间，不等于任务实际运行时长。</p></section>
+<section class="panel"><div class="toolbar"><h2>调用明细</h2><label>排序<select id="sort"><option value="newest">时间：最新优先</option><option value="slowest">耗时：最慢优先</option><option value="input">输入 token：最多优先</option></select></label><button id="prev">上一页</button><span id="page"></span><button id="next">下一页</button></div>
+<div class="scroll"><table><thead><tr><th>时间</th><th>Agent / 工具</th><th>模型 / 用途</th><th>状态</th><th>输入</th><th>输出</th><th>秒</th><th>明细</th></tr></thead><tbody id="calls"></tbody></table></div></section>
+</main><script type="application/json" id="data">__REPORT_DATA__</script>
+<script>
+'use strict';
+const data=JSON.parse(document.getElementById('data').textContent),events=data.events;
+const calls=events.filter(e=>e.event==='llm_call');
+const $=id=>document.getElementById(id), number=v=>typeof v==='number'&&Number.isFinite(v), fmt=v=>number(v)?v.toLocaleString():'未知';
+const text=(tag,value)=>{const el=document.createElement(tag);el.textContent=value;return el};
+const key=(e,k)=>String(e[k]??'未归属');
+let page=0;
+$('title').textContent='调用报告 · '+data.run;
+$('meta').textContent='离线报告 · '+calls.length+' 次模型调用 · 跳过 '+data.skipped+' 行损坏日志。任务结束后自动更新，刷新页面查看。';
+const fields=[['task_id','任务'],['agent','Agent'],['model','模型'],['tool','工具'],['purpose','用途'],['status','状态']];
+for(const [field,label] of fields){const node=text('label',label),select=document.createElement('select');select.id=field;select.add(new Option('全部',''));const values=field==='task_id'?events.filter(e=>e.task_id):calls;for(const v of [...new Set(values.map(e=>key(e,field)))].sort())select.add(new Option(v,v));select.onchange=()=>{page=0;render()};node.append(select);$('filters').append(node)}
+for(const [id,label,type] of [['from','开始时间','datetime-local'],['to','结束时间','datetime-local'],['search','查找调用 / 请求 ID / 错误','search']]){const node=text('label',label),input=document.createElement('input');input.id=id;input.type=type;input.oninput=()=>{page=0;render()};node.append(input);$('filters').append(node)}
+function filtered(){const from=$('from').value?new Date($('from').value).getTime()/1000:-Infinity,to=$('to').value?new Date($('to').value).getTime()/1000:Infinity,q=$('search').value.toLowerCase();return calls.filter(e=>fields.every(([k])=>!$(k).value||key(e,k)===$(k).value)&&((from===-Infinity&&to===Infinity)||(number(e.ts)&&e.ts>=from&&e.ts<=to))&&[e.call_id,e.request_id,e.error_type].some(v=>String(v??'').toLowerCase().includes(q)))}
+function sum(rows,k){const known=rows.map(e=>e[k]).filter(number);return {value:known.length?known.reduce((a,b)=>a+b,0):null,unknown:rows.length-known.length}}
+function card(parent,label,value,note=''){const div=document.createElement('div');div.className='card';div.append(text('span',label),text('strong',value),text('small',note));parent.append(div)}
+function row(parent,values){const tr=document.createElement('tr');for(const v of values)tr.append(text('td',v));parent.append(tr);return tr}
+function render(){const rows=filtered();$('count').textContent='当前 '+rows.length+' / '+calls.length+' 次调用';$('cards').replaceChildren();card($('cards'),'调用次数',rows.length);card($('cards'),'失败调用',rows.filter(e=>e.status==='failed').length);for(const [k,label] of [['input_tokens','已知输入 token'],['output_tokens','已知输出 token'],['cache_read_input_tokens','已知缓存读取'],['cache_creation_input_tokens','已知缓存写入']]){const s=sum(rows,k);card($('cards'),label,fmt(s.value),s.unknown+' 次调用该字段未知')}
+const group=$('group').value,groups=new Map();for(const e of rows){const k=key(e,group);if(!groups.has(k))groups.set(k,[]);groups.get(k).push(e)}$('ranking').replaceChildren();for(const [k,items] of [...groups].sort((a,b)=>(sum(b[1],'input_tokens').value??-1)-(sum(a[1],'input_tokens').value??-1))){row($('ranking'),[k,items.length,fmt(sum(items,'input_tokens').value),fmt(sum(items,'output_tokens').value),items.filter(e=>e.status==='failed').length,fmt(sum(items,'duration').value)])}if(!rows.length)row($('ranking'),['无匹配调用']);
+$('durations').replaceChildren();for(const [label,lo,hi] of [['< 1 秒',0,1],['1–5 秒',1,5],['5–30 秒',5,30],['≥ 30 秒',30,Infinity]])card($('durations'),label,rows.filter(e=>number(e.duration)&&e.duration>=lo&&e.duration<hi).length);card($('durations'),'耗时未知',rows.filter(e=>!number(e.duration)).length);
+const summaries=new Map();for(const e of events){if(e.task_id){const old=summaries.get(e.task_id);if(!old||e.event==='task_usage')summaries.set(e.task_id,e)}}$('tasks').replaceChildren();for(const [id,e] of summaries){if($('task_id').value&&$('task_id').value!==id)continue;const match=rows.filter(c=>c.task_id===id).length;$('tasks').append(text('p',id+' · '+(e.event==='task_usage'?(e.status==='success'?'执行结束':'异常结束'):'未记录结束事件')+' · 当前筛选 '+match+' 次调用'+(e.event==='task_usage'?' · 任务耗时 '+fmt(e.duration)+' 秒':'')))}if(!summaries.size)$('tasks').append(text('p','没有任务事件；旧版日志无法补回 API 用量。'));
+const sorted=[...rows].sort((a,b)=>{const k={newest:'ts',slowest:'duration',input:'input_tokens'}[$('sort').value];return (number(b[k])?b[k]:-1)-(number(a[k])?a[k]:-1)});const pages=Math.max(1,Math.ceil(rows.length/50));page=Math.min(page,pages-1);$('page').textContent=(page+1)+' / '+pages;$('prev').disabled=page===0;$('next').disabled=page===pages-1;$('calls').replaceChildren();for(const e of sorted.slice(page*50,page*50+50)){const tr=row($('calls'),[number(e.ts)?new Date(e.ts*1000).toLocaleString():'未知',key(e,'agent')+' / '+key(e,'tool'),key(e,'model')+' / '+key(e,'purpose'),e.status??'未知',fmt(e.input_tokens),fmt(e.output_tokens),fmt(e.duration)]);const td=document.createElement('td'),detail=document.createElement('details');detail.append(text('summary','展开'),text('pre',JSON.stringify(e,null,2)));td.append(detail);tr.append(td);if(e.status==='failed')tr.className='bad'}if(!rows.length)row($('calls'),['没有匹配的调用记录'])}
+$('reset').onclick=()=>{fields.forEach(([k])=>$(k).value='');['from','to','search'].forEach(k=>$(k).value='');page=0;render()};$('group').onchange=render;$('sort').onchange=()=>{page=0;render()};$('prev').onclick=()=>{page--;render()};$('next').onclick=()=>{page++;render()};render();
+</script></body></html>

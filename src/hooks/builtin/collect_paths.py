@@ -3,6 +3,7 @@
 from pathlib import Path
 
 from ..base import Hook
+from ...tools.builtin._safe_path import safe_resolve
 
 # 产出文件工具 → 输出路径参数名
 OUTPUT_PATH_PARAM = {
@@ -33,7 +34,11 @@ class CollectWrittenPathsHook(Hook):
             ok = '"status": "ok"' in output
         if ok and isinstance(p, str) and p:
             try:
-                agent._written_paths.add(str(Path(p).resolve()))
-            except (OSError, ValueError):
+                resolved = str(safe_resolve(p))
+                agent._written_paths.add(resolved)
+                if (agent.name == "WritingAgent" and agent.context is not None
+                        and Path(resolved) == (Path(agent.context.output_dir) / "main.tex").resolve()):
+                    agent.context.set_main_tex_path(resolved)
+            except (AttributeError, OSError, ValueError):
                 pass
         return None

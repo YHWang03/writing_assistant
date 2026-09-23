@@ -3,6 +3,17 @@
 import os
 from pathlib import Path
 from anthropic import Anthropic
+from time import perf_counter
+from uuid import uuid4
+
+from ..observability.telemetry import TOKEN_FIELDS, record_call, call_scope
+
+
+class IncompleteResponseError(RuntimeError):
+    """输出预算耗尽；不向调用者暴露可能不完整的文本或工具参数。"""
+
+
+MAX_RECOVERY_TOKENS = 32768
 
 
 def _find_and_load_dotenv():
@@ -64,7 +75,7 @@ class LLM:
         self._client = Anthropic(api_key=api_key, base_url=base_url)
 
     def chat(self, messages: list[dict], system: str = "",
-             max_tokens: int = 4096) -> str:
+             max_tokens: int = 4096, *, truncation_retries: int = 1) -> str:
         """纯文本调用。
 
         paras:
@@ -73,7 +84,8 @@ class LLM:
             max_tokens: 最大输出 token 数
         return: 模型文本回答
         """
-        response = self._client.messages.create(
+        response = self._create_complete(
+            truncation_retries=truncation_retries,
             model=self.model,
             max_tokens=max_tokens,
             system=system,
@@ -93,13 +105,67 @@ class LLM:
             max_tokens: 最大输出 token 数
         return: Messages API response 对象
         """
-        return self._client.messages.create(
+        return self._create_complete(
             model=self.model,
             max_tokens=max_tokens,
             system=system,
             messages=messages,
             tools=tools,
         )
+
+    def _create_complete(self, *, truncation_retries=1, **kwargs):
+        """从原请求重试一次，不把截断结果加入历史或执行其中的工具。"""
+        request = dict(kwargs)
+        recovery_id = uuid4().hex
+        for attempt in range(truncation_retries + 1):
+            with call_scope(recovery_id=recovery_id, attempt=attempt + 1,
+                            requested_max_tokens=request["max_tokens"]):
+                response = self._create(**request)
+            if getattr(response, "stop_reason", None) != "max_tokens":
+                return response
+            if attempt == truncation_retries:
+                break
+            request["max_tokens"] = max(
+                request["max_tokens"], min(request["max_tokens"] * 2, MAX_RECOVERY_TOKENS))
+            request["system"] = (kwargs.get("system", "") +
+                "\n上次输出超出预算。请压缩推理和解释，优先完整输出所需结果；"
+                "不要省略工具必需参数，不要截断文件正文或 JSON。")
+        raise IncompleteResponseError(
+            f"模型输出不完整（max_tokens），共尝试 {truncation_retries + 1} 次；"
+            "未采用截断内容，请缩小任务或分段生成。")
+
+    def _create(self, **kwargs):
+        """Record one SDK invocation, preserving raw provider usage verbatim."""
+        started = perf_counter()
+        event = dict(call_id=uuid4().hex, model=self.model, status="failed",
+                     usage=None, usage_source="unknown", request_id=None,
+                     operation="chat_with_tools" if "tools" in kwargs else "chat")
+        event.update({key: None for key in TOKEN_FIELDS})
+        try:
+            response = self._client.messages.create(**kwargs)
+            event["status"] = ("incomplete" if getattr(response, "stop_reason", None)
+                               == "max_tokens" else "success")
+            event["request_id"] = getattr(response, "_request_id", None)
+            event["response_id"] = getattr(response, "id", None)
+            event["response_model"] = getattr(response, "model", None)
+            event["stop_reason"] = getattr(response, "stop_reason", None)
+            usage = getattr(response, "usage", None)
+            if usage is not None:
+                raw = usage.model_dump(mode="json") if hasattr(usage, "model_dump") else dict(usage)
+                event.update(usage=raw, usage_source="api")
+                for key in TOKEN_FIELDS:
+                    value = raw.get(key)
+                    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                        event[key] = value
+            return response
+        except BaseException as exc:
+            event["error_type"] = type(exc).__name__
+            event["request_id"] = getattr(exc, "request_id", None)
+            event["http_status"] = getattr(exc, "status_code", None)
+            raise
+        finally:
+            event["duration"] = perf_counter() - started
+            record_call(event)
 
     def __repr__(self) -> str:
         return f"LLM(model={self.model})"

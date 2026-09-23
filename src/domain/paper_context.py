@@ -2,7 +2,9 @@
 
 from dataclasses import dataclass, field
 from datetime import datetime
+from copy import deepcopy
 import logging
+from types import MappingProxyType
 
 from .paper import Paper
 
@@ -48,7 +50,7 @@ class PaperContext:
         for existing in self.reference_library:
             if existing.cite_key == ref.cite_key:
                 return
-        self.reference_library.append(ref)
+        self.reference_library.append(deepcopy(ref))
 
     def set_section(self, name: str, content: str):
         """设置章节内容。
@@ -59,6 +61,37 @@ class PaperContext:
         return: 无
         """
         self.sections[name] = content
+
+    def update_reference(self, cite_key: str, changes: dict):
+        """只修改显式传入的字段，保留摘要等已有信息；引用键不可隐式改名。"""
+        from dataclasses import fields, replace
+        allowed = {f.name for f in fields(Paper)} - {"cite_key", "source", "provenance_kind", "provenance_title", "source_pdf", "source_fingerprint"}
+        if not changes or set(changes) - allowed:
+            raise ValueError("无效或空的文献更新字段")
+        for key, value in changes.items():
+            valid = (isinstance(value, int) and not isinstance(value, bool) if key == "year"
+                     else isinstance(value, list) and all(isinstance(v, str) for v in value) if key == "keywords"
+                     else isinstance(value, dict) and all(isinstance(k, str) and isinstance(v, str) for k, v in value.items()) if key == "bib_fields"
+                     else isinstance(value, str))
+            if not valid:
+                raise ValueError(f"字段类型错误: {key}")
+        for i, ref in enumerate(self.reference_library):
+            if ref.cite_key == cite_key:
+                self.reference_library[i] = replace(ref, **deepcopy(changes))
+                if "title" in changes:
+                    from .reference_provenance import title_key
+                    if title_key(changes['title']) != title_key(ref.title):
+                        self.reference_library[i].provenance_kind = ""
+                        self.reference_library[i].provenance_title = ""
+                        self.reference_library[i].source_pdf = ""
+                        self.reference_library[i].source_fingerprint = ""
+                return
+        raise ValueError(f"文献不存在: {cite_key}")
+
+    def remove_reference(self, cite_key: str):
+        if cite_key not in self.get_all_cite_keys():
+            raise ValueError(f"文献不存在: {cite_key}")
+        self.reference_library[:] = [r for r in self.reference_library if r.cite_key != cite_key]
 
     def get_section(self, name: str) -> str:
         """获取章节内容。
@@ -133,7 +166,13 @@ class AgentContextView:
             raise AttributeError(
                 f"AgentContextView: 字段 '{name}' 不可读（当前 Agent 无权读取）"
             )
-        return getattr(self._context, name)
+        value = getattr(self._context, name)
+        if isinstance(value, (list, dict)):
+            raise AttributeError(
+                f"AgentContextView: 字段 '{name}' 是可变集合；"
+                "请使用 read() 或对应的领域查询方法"
+            )
+        return value
 
     def __setattr__(self, name: str, value):
         """字段写入代理，越权抛错。
@@ -150,6 +189,8 @@ class AgentContextView:
             raise AttributeError(
                 f"AgentContextView: 字段 '{name}' 不可写（当前 Agent 无权修改）"
             )
+        if isinstance(getattr(self._context, name), (list, dict)):
+            raise AttributeError(f"AgentContextView: 集合 '{name}' 必须通过领域命令修改")
         setattr(self._context, name, value)
 
     def add_reference(self, ref: Paper):
@@ -163,6 +204,39 @@ class AgentContextView:
             raise AttributeError("AgentContextView: 无权修改 reference_library")
         self._context.add_reference(ref)
 
+    def read(self, field: str):
+        """Return an immutable snapshot of a readable field."""
+        if field not in self._readable:
+            raise AttributeError(f"AgentContextView: 字段 '{field}' 不可读")
+        value = getattr(self._context, field)
+        if isinstance(value, list):
+            return tuple(deepcopy(value))
+        if isinstance(value, dict):
+            return MappingProxyType(deepcopy(value))
+        return value
+
+    def update_reference(self, cite_key: str, changes: dict):
+        if "reference_library" not in self._writable:
+            raise AttributeError("AgentContextView: 无权修改 reference_library")
+        self._context.update_reference(cite_key, changes)
+
+    def remove_reference(self, cite_key: str):
+        if "reference_library" not in self._writable:
+            raise AttributeError("AgentContextView: 无权修改 reference_library")
+        self._context.remove_reference(cite_key)
+
+    def get_references(self) -> tuple[Paper, ...]:
+        """Return a detached, immutable reference-library snapshot."""
+        return self.read("reference_library")
+
+    def get_sections(self):
+        """Return a detached, read-only section mapping."""
+        return self.read("sections")
+
+    def get_modifications(self) -> tuple[dict, ...]:
+        """Return detached modification-log entries."""
+        return self.read("modification_log")
+
     def set_section(self, name: str, content: str):
         """权限校验后设置章节。
 
@@ -174,6 +248,12 @@ class AgentContextView:
         if "sections" not in self._writable:
             raise AttributeError("AgentContextView: 无权修改 sections")
         self._context.set_section(name, content)
+
+    def set_main_tex_path(self, path: str) -> None:
+        """Record the generated main TeX path through an authorized command."""
+        if "main_tex_path" not in self._writable:
+            raise AttributeError("AgentContextView: 无权修改 main_tex_path")
+        self._context.main_tex_path = path
 
     def get_section(self, name: str) -> str:
         """权限校验后读取章节。

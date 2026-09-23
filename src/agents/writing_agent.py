@@ -1,18 +1,21 @@
-"""WritingAgent — 论文写作 Agent：基于模板撰写论文各章节并生成完整的 paper_draft.tex。"""
+"""WritingAgent — 论文写作 Agent：基于模板撰写论文并生成 main.tex。"""
 
 from ..core.agent import Agent
 from ..core.llm import LLM
 from ..prompts import load_prompt
-from ..tools.registry import ToolRegistry
 from ..tools.builtin import ReadFileTool, WriteFileTool, ListFilesTool, ScanCitationsTool, LookupPaperInfoTool, ReadContextTool, ListCiteKeysTool, FinishTool
-from ..hooks.builtin import (
-    MemoryRecallHook, DeadlineNudgeHook, CollectWrittenPathsHook,
-    FinishNudgeHook, OutputGateHook, MemoryExtractHook,
-)
+from ._common import STANDARD_HOOKS
 
 
 class WritingAgent(Agent):
     """论文写作 Agent"""
+
+    tool_types = (
+        ReadFileTool, WriteFileTool, ListFilesTool, ScanCitationsTool,
+        LookupPaperInfoTool, ReadContextTool, ListCiteKeysTool, FinishTool,
+    )
+    hook_types = STANDARD_HOOKS
+    declared_output_exts = (".tex",)
 
     def __init__(self, llm: LLM, max_steps: int = 10, max_tokens: int = 8192,
                  run_mode: str = "react"):
@@ -31,44 +34,7 @@ class WritingAgent(Agent):
             max_steps=max_steps, max_tokens=max_tokens,
             run_mode=run_mode,
         )
-        self._setup_tools()
-        self._setup_hooks()
-        self.required_output_exts = [".tex"]
-
-    def _setup_tools(self):
-        """注册本 Agent 的工具集。
-
-        paras: 无
-        return: 无
-        """
-        self.tool_registry = ToolRegistry()
-        read_file = ReadFileTool()
-        read_file.set_agent_name("WritingAgent")
-        self.tool_registry.register(read_file)
-        write_file = WriteFileTool()
-        write_file.set_agent_name("WritingAgent")
-        self.tool_registry.register(write_file)
-        self.tool_registry.register(ListFilesTool())
-        self.tool_registry.register(ScanCitationsTool())
-        self.tool_registry.register(LookupPaperInfoTool())
-        self._read_context = ReadContextTool()
-        self.tool_registry.register(self._read_context)
-        self._list_cite_keys = ListCiteKeysTool()
-        self.tool_registry.register(self._list_cite_keys)
-        self.tool_registry.register(FinishTool())
-
-    def _setup_hooks(self):
-        """注册本 Agent 的 hooks。
-
-        paras: 无
-        return: 无
-        """
-        self.hooks.register(MemoryRecallHook())
-        self.hooks.register(DeadlineNudgeHook())
-        self.hooks.register(CollectWrittenPathsHook())
-        self.hooks.register(FinishNudgeHook())
-        self.hooks.register(OutputGateHook())
-        self.hooks.register(MemoryExtractHook())
+        self._setup_declared_components()
 
     def _sync_context_to_tools(self):
         """将 PaperContext 中的 reference_library 与 context 注入到各工具。
@@ -78,20 +44,10 @@ class WritingAgent(Agent):
         """
         if self.context is None:
             return
-        try:
-            lookup = self.tool_registry.get_tool("lookup_paper_info")
-            if lookup is not None:
-                lookup.set_reference_library(self.context.reference_library)
-        except Exception:
-            pass
-        try:
-            self._list_cite_keys.set_reference_library(self.context.reference_library)
-        except Exception:
-            pass
-        try:
-            self._read_context.set_context(self.context)
-        except Exception:
-            pass
+        references = self.context.get_references()
+        self.require_tool("lookup_paper_info").set_reference_library(references)
+        self.require_tool("list_cite_keys").set_reference_library(references)
+        self.require_tool("read_context").set_context(self.context)
 
     def run(self, input_text: str) -> str:
         """运行 WritingAgent 执行循环。
