@@ -1,4 +1,4 @@
-"""文献搜索工具 — OpenAlex / Semantic Scholar / arXiv 在线搜索与论文验证。
+"""文献搜索工具 — OpenAlex / Semantic Scholar / arXiv 在线搜索。
 
 网络统一走 _http_get（指数退避 + 全抖动 + Retry-After + 分主机限流），结果落盘缓存；
 auto 后端按 OpenAlex → Semantic Scholar → arXiv 依次回退。
@@ -14,6 +14,8 @@ import urllib.parse
 import urllib.error
 from pathlib import Path
 from ..base import Tool
+from ...observability.tracing import span, emit
+from .openalex import openalex_headers as _openalex_headers, reconstruct_abstract as _reconstruct_abstract
 
 _RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 _MAX_RETRIES = 5
@@ -41,6 +43,12 @@ class _SearchError(Exception):
     """搜索失败（含可读的 reason / hint），供上层转成结构化返回。"""
 
     def __init__(self, reason: str, hint: str = ""):
+        '''保存搜索失败原因和恢复提示，并初始化异常信息。
+
+        paras:
+            reason: 失败或验证结果的原因说明。
+            hint: 供调用方处理搜索失败的提示。
+        '''
         super().__init__(reason)
         self.reason = reason
         self.hint = hint
@@ -66,32 +74,8 @@ def _s2_headers() -> dict:
     return headers
 
 
-def _openalex_headers() -> dict:
-    """构造 OpenAlex 请求头（User-Agent 带 mailto，可用 .env 的 OPENALEX_MAILTO 配置）。
-
-    return: 请求头 dict
-    """
-    mailto = os.getenv("OPENALEX_MAILTO", "")
-    ua = "WritingAssistant/1.0"
-    if mailto:
-        ua += f" (mailto:{mailto})"
-    return {"User-Agent": ua}
 
 
-def _reconstruct_abstract(inv: dict | None) -> str:
-    """还原 OpenAlex 的倒排索引摘要（{词: [位置]}）为原文。
-
-    paras:
-        inv: 倒排索引 dict
-    return: 摘要文本；无索引返回空串
-    """
-    if not inv:
-        return ""
-    pos_to_word = {}
-    for word, positions in inv.items():
-        for p in positions:
-            pos_to_word[p] = word
-    return " ".join(pos_to_word[i] for i in sorted(pos_to_word))
 
 
 def _arxiv_id_from_doi(doi: str) -> str:
@@ -176,7 +160,8 @@ def _throttle(host: str):
     last = _host_last_request.get(host, 0.0)
     wait = min_interval - (now - last)
     if wait > 0:
-        time.sleep(wait)
+        with span('network_wait', host=host, reason='throttle', requested_seconds=wait):
+            time.sleep(wait)
     _host_last_request[host] = time.time()
 
 
@@ -215,16 +200,25 @@ def _http_get(url: str, host: str, headers: dict | None = None,
         _throttle(host)
         try:
             req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return resp.read().decode("utf-8")
+            with span('network', host=host, url=url, attempt=attempt + 1, timeout=timeout) as trace:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    result = resp.read().decode("utf-8")
+                    trace.update(http_status=getattr(resp, 'status', None), result_size=len(result))
+                    return result
         except urllib.error.HTTPError as e:
             if e.code not in _RETRYABLE_STATUS:
                 raise _NetworkError(f"HTTP {e.code} {e.reason}") from e
             last_exc = e
-            time.sleep(_retry_delay(attempt, e.headers.get("Retry-After")))
+            delay = _retry_delay(attempt, e.headers.get("Retry-After"))
+            with span('network_wait', host=host, reason='retry', attempt=attempt + 1,
+                      http_status=e.code, requested_seconds=delay):
+                time.sleep(delay)
         except (urllib.error.URLError, TimeoutError, OSError) as e:
             last_exc = e
-            time.sleep(_retry_delay(attempt))
+            delay = _retry_delay(attempt)
+            with span('network_wait', host=host, reason='retry', attempt=attempt + 1,
+                      error_type=type(e).__name__, requested_seconds=delay):
+                time.sleep(delay)
     raise _NetworkError(f"连续 {max_retries} 次失败: {last_exc}") from last_exc
 
 
@@ -260,6 +254,8 @@ class SearchPapersTool(Tool):
     """在线搜索论文（多后端，带缓存与限流）"""
 
     def __init__(self):
+        '''初始化文献搜索工具、请求预算及历史查询记录。
+        '''
         super().__init__(
             name="search_papers",
             description="在线搜索论文。返回 JSON：{\"ok\": true, \"backend\": ..., \"results\": [...]} "
@@ -267,6 +263,7 @@ class SearchPapersTool(Tool):
                         "backend 支持 auto（默认，按 OpenAlex → Semantic Scholar → arXiv 依次回退）、"
                         "openalex、semantic_scholar、arxiv。"
         )
+        self.results = {}
         self.max_searches = 8
         self._search_count = 0
 
@@ -275,10 +272,7 @@ class SearchPapersTool(Tool):
         self._search_count = 0
 
     def get_parameters(self) -> dict:
-        """返回工具参数的 JSON Schema 定义。
-
-        return: input_schema 字典
-        """
+        """返回工具参数的 JSON Schema 定义。"""
         return {
             "type": "object",
             "properties": {
@@ -295,13 +289,20 @@ class SearchPapersTool(Tool):
 
     def execute(self, query: str, max_results: int = 5,
                 backend: str = "auto") -> str:
+        '''执行文献搜索并保留实际返回的记录，供后续入库取用。
+
+        paras:
+            query: 文献搜索关键词。
+            max_results: 最多返回的文献数量。
+            backend: 搜索后端名称；auto 按内置顺序回退。
+        return: 搜索结果 JSON 字符串。
+        '''
         result = self._execute_search(query, max_results, backend)
-        provenance = getattr(self, "provenance", None)
-        if provenance is not None:
-            obj = json_mod.loads(result)
-            if obj.get("ok"):
-                for paper in obj.get("results", []):
-                    provenance.record(paper.get("title", ""), "search")
+        obj = json_mod.loads(result)
+        if obj.get('ok'):
+            for paper in obj.get('results', []):
+                if paper.get('title'):
+                    self.results[paper['title'].strip().casefold()] = dict(paper)
         return result
 
     def _execute_search(self, query: str, max_results: int = 5,
@@ -320,7 +321,7 @@ class SearchPapersTool(Tool):
             return json_mod.dumps({
                 "ok": False, "backend": backend, "stop": True,
                 "error": f"搜索次数已达上限（{self.max_searches} 次），已停止联网检索。",
-                "hint": "改用 get_paper_text 读 PDF 页眉获取元数据，或把无法确定的文献标记为 unresolved 上报；不要再调用 search_papers。",
+                "hint": "保留已有信息，将无法确定的文献标记为 unresolved 上报；不要再调用 search_papers，也不要尝试读取 PDF 补全。",
             }, ensure_ascii=False)
         try:
             if backend == "arxiv":
@@ -339,7 +340,7 @@ class SearchPapersTool(Tool):
             return _err(backend, error=f"搜索失败: {e}")
 
     def _search_auto(self, query: str, max_results: int) -> str:
-        """按 OpenAlex → Semantic Scholar → arXiv 依次尝试，失败自动回退。
+        """按 OpenAlex → Semantic Scholar → arXiv 依次尝试，失败或空结果自动回退。
 
         paras:
             query: 搜索关键词
@@ -352,21 +353,40 @@ class SearchPapersTool(Tool):
             ("arxiv", self._search_arxiv),
         ]
         failed = []
+        empty = []
         for name, fn in attempts:
             try:
                 obj = json_mod.loads(fn(query, max_results))
+                if not isinstance(obj, dict) or not obj.get("ok"):
+                    raise _SearchError(obj.get("error", "后端返回失败") if isinstance(obj, dict) else "后端返回非对象")
+                if not isinstance(obj.get("results"), list):
+                    raise _SearchError("后端 results 不是列表")
             except _SearchError as e:
                 failed.append(f"{name}({e.reason})")
                 continue
             except Exception as e:
                 failed.append(f"{name}({e})")
                 continue
-            if failed:
-                note = f"{' → '.join(f.split('(')[0] for f in failed)} 失败，已回退到 {name}"
+            if not obj["results"]:
+                empty.append(name)
+                continue
+            if failed or empty:
+                parts = []
+                if failed:
+                    parts.append(f"{' → '.join(f.split('(')[0] for f in failed)} 请求失败")
+                if empty:
+                    parts.append(f"{' → '.join(empty)} 无结果")
+                note = "；".join(parts) + f"；已回退到 {name}"
                 if obj.get("note"):
                     note += f"；{obj['note']}"
                 obj["note"] = note
             return json_mod.dumps(obj, ensure_ascii=False, indent=2)
+        if empty:
+            note = f"{' → '.join(empty)} 查询成功但无结果"
+            if failed:
+                note += "；部分后端失败，搜索范围不完整：" + "；".join(failed)
+            return json_mod.dumps({"ok": True, "backend": "auto", "results": [],
+                                   "note": note, "partial": bool(failed)}, ensure_ascii=False)
         return _err("auto", error="；".join(failed),
                     hint="稍后重试，或检查网络 / 设置 S2_API_KEY")
 
@@ -380,6 +400,7 @@ class SearchPapersTool(Tool):
         """
         cache = _load_cache()
         cache_key = f"search:{_normalize_cache_key(query)}"
+        emit("search_cache", cache_key=cache_key, cache_hit=cache_key in cache)
         if cache_key in cache:
             try:
                 papers = json_mod.loads(cache[cache_key])
@@ -430,6 +451,7 @@ class SearchPapersTool(Tool):
         """
         cache = _load_cache()
         cache_key = f"openalex:{_normalize_cache_key(query)}"
+        emit("search_cache", cache_key=cache_key, cache_hit=cache_key in cache)
         if cache_key in cache:
             try:
                 papers = json_mod.loads(cache[cache_key])
@@ -485,6 +507,7 @@ class SearchPapersTool(Tool):
 
         cache = _load_cache()
         cache_key = f"arxiv:{_normalize_cache_key(query)}"
+        emit("search_cache", cache_key=cache_key, cache_hit=cache_key in cache)
         if cache_key in cache:
             try:
                 papers = json_mod.loads(cache[cache_key])
@@ -543,71 +566,3 @@ class SearchPapersTool(Tool):
             ) from e
         except Exception as e:
             raise _SearchError(reason=f"arXiv 解析失败: {e}") from e
-
-
-class VerifyPaperTool(Tool):
-    """验证论文是否真实存在（复用 SearchPapersTool 的级联搜索）"""
-
-    def __init__(self):
-        super().__init__(
-            name="verify_paper",
-            description="仅对模型凭记忆提出的文献搜索验证：规范化标题一致即通过。"
-                        "用户PDF不验证存在性；已有搜索结果不重复验证。通过不代表其他元数据或引用论断正确。"
-        )
-        self._searcher = SearchPapersTool()
-
-    def get_parameters(self) -> dict:
-        """返回工具参数的 JSON Schema 定义。
-
-        return: input_schema 字典
-        """
-        return {
-            "type": "object",
-            "properties": {
-                "title": {"type": "string", "description": "论文标题"},
-            },
-            "required": ["title"],
-        }
-
-    def execute(self, title: str, authors: str = "", year: int = 0, doi: str = "") -> str:
-        """只核对标题；authors/year/doi 仅为兼容旧调用保留，不参与判定。"""
-        import unicodedata
-
-        def normalize(value):
-            value = unicodedata.normalize("NFKD", str(value)).casefold()
-            return " ".join(re.findall(r"[^\W_]+", "".join(c for c in value if not unicodedata.combining(c))))
-
-        def answer(status, reason, **extra):
-            return json_mod.dumps({"verified": status == "matched", "status": status,
-                                   "reason": reason, **extra}, ensure_ascii=False)
-
-        if not normalize(title):
-            return answer("invalid_input", "标题不能为空")
-        provenance = getattr(self, "provenance", None)
-        if provenance is not None and provenance.lookup(title):
-            return json_mod.dumps({"verified": provenance.lookup(title) == "verified_title",
-                                   "status": "not_required", "network_called": False,
-                                   "reason": "已有PDF/搜索来源或标题验证凭据，不重复联网"}, ensure_ascii=False)
-        try:
-            obj = json_mod.loads(self._searcher._search_auto(title, 5))
-        except Exception as exc:
-            return answer("search_failed", f"检索失败，不能据此判定文献不存在: {exc}")
-        if not obj.get("ok"):
-            return answer("search_failed", obj.get("error") or "检索未成功")
-        papers = obj.get("results", [])
-        if not papers:
-            return answer("not_found", "本次检索未找到候选，不代表文献不存在")
-
-        matches = [paper for paper in papers
-                   if isinstance(paper, dict) and normalize(paper.get("title", "")) == normalize(title)]
-        if not matches:
-            return answer("unconfirmed", "本次候选中没有标题一致的文献，不代表文献不存在",
-                          candidates=papers, backend=obj.get("backend"), checked_fields=["title"])
-        # 同名多版本也通过标题存在性检查，但不自动选定其中一个版本的元数据。
-        metadata = ({k: matches[0].get(k, "") for k in ("title", "authors", "year", "abstract", "doi")}
-                    if len(matches) == 1 else {"title": title})
-        if provenance is not None:
-            provenance.record(title, "verified_title")
-        return answer("matched", "检索到同名文献；仅核对标题，未验证作者、年份、DOI或正文论断",
-                      **metadata, candidates=matches, match_count=len(matches),
-                      backend=obj.get("backend"), checked_fields=["title"])

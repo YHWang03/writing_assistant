@@ -8,7 +8,6 @@ from ...tools.builtin._safe_path import safe_resolve
 # 产出文件工具 → 输出路径参数名
 OUTPUT_PATH_PARAM = {
     "write_file": "file_path",
-    "write_bib_file": "output_path",
     "generate_bib_from_ref_library": "path",
 }
 
@@ -30,7 +29,7 @@ class CollectWrittenPathsHook(Hook):
             return None
         p = block.input.get(path_param)
         ok = not output.startswith(("Error:", "警告:"))
-        if block.name in ("write_bib_file", "generate_bib_from_ref_library"):
+        if block.name == "generate_bib_from_ref_library":
             ok = '"status": "ok"' in output
         if ok and isinstance(p, str) and p:
             try:

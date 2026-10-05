@@ -59,7 +59,7 @@ SUMMARY_SYSTEM = (
 
 
 def is_context_overflow_error(e: Exception) -> bool:
-    """判断异常是否为 API 上下文超限。
+    """判断异常是否为 API 上下文超限
 
     paras:
         e: 捕获到的异常
@@ -175,6 +175,7 @@ def _tool_result_budget(messages: list[dict]) -> tuple[list, bool]:
         new_blocks[new_blocks.index(b)] = {**b, "content": replacement}
         total -= len(output) - len(replacement)
 
+    # 没有超预算的 tool_result，直接返回
     if new_blocks is None:
         return messages, False
     return [*messages[:-1], {**last, "content": new_blocks}], True
@@ -373,6 +374,7 @@ def _call_summary_llm(llm, content_text: str, agent_name: str) -> str:
             messages=[{"role": "user", "content": _limit_text(content_text)}],
             system=SUMMARY_SYSTEM,
             max_tokens=2000,
+            thinking=False,
         ).strip()
         return result or _fallback_summary(content_text)
     except Exception as e:
@@ -425,7 +427,7 @@ def compress_messages(messages: list[dict], keep_recent: int, context_window: in
                       last_output_tokens: int = 0) -> list:
     """按四步管线压缩 step 循环中的 dict 消息列表。
 
-    token 估算优先用 anchor（上轮 API 真实 input_tokens + output_tokens），
+    token 估算优先用 anchor（上轮 API 非缓存输入 + 缓存读取 + 缓存写入，再加 output_tokens），
     落盘整理后回退本地精确估算。
 
     paras:
@@ -434,7 +436,7 @@ def compress_messages(messages: list[dict], keep_recent: int, context_window: in
         context_window: 上下文窗口大小
         llm: LLM 实例（步骤 4 摘要用）
         agent_name: Agent 名（日志用）
-        anchor_input_tokens: 上轮 API 真实 input_tokens；None 表示无 anchor
+        anchor_input_tokens: 上轮 API 总输入（含缓存）；None 表示无 anchor
         last_output_tokens: 上轮 API output_tokens
     return: 处理后的消息列表；无改动时返回原列表
     """
@@ -451,7 +453,7 @@ def compress_messages(messages: list[dict], keep_recent: int, context_window: in
     if len(messages) <= keep_recent:
         return messages
 
-    if anchor_input_tokens:
+    if anchor_input_tokens is not None:
         estimated = anchor_input_tokens + (last_output_tokens or 0)
     else:
         estimated = estimate_tokens(messages)

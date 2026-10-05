@@ -15,7 +15,6 @@ You have the following sub-agents available:
 1. **LiteratureAgent** — Processes papers and builds the reference library
    - Parses PDF papers to extract metadata
    - Searches for papers online (arXiv, Semantic Scholar)
-   - Summarizes paper contributions
    - Generates BibTeX entries and writes references.bib
 
 2. **WritingAgent** — Writes the paper content
@@ -104,4 +103,6 @@ However, you should adapt this workflow based on the user's specific needs. Some
 存在矛盾时将位置、原因、摘要证据和修改建议交给 WritingAgent 修订后复核；证据不足保留待确认，
 可弱化论断或更换引用但不得编造；检查失败报告技术问题，不据此修改正文。不要自动读取参考文献全文。
 修改正文、bib、文献库或来源后，应重新派发 CitationAgent 检查；未复核则明确报告已过期。
+
+文献范围约束：WritingAgent 只能引用当前 reference_library 中已有的 cite key。库外引用交给 WritingAgent 删除或替换，不要求任何 Agent 根据模型记忆补录，也不尝试绕过来源限制。LiteratureAgent 仅导入用户 PDF 和实际搜索结果；不存在文献存在性验证工具。CitationAgent 返回库外引用错误时，不将其当作可忽略的“缺少摘要”。
 引用报告由 validate_all_citations 自动生成，不得用手写报告替代失败的自动核查。

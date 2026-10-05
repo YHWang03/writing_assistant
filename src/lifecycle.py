@@ -19,6 +19,12 @@ class Application:
     _closed: bool = False
 
     def run_task(self, prompt: str) -> str:
+        '''运行 Master 任务并统计调用消耗，在总结前附加当前引用核查状态。
+
+        paras:
+            prompt: 用户提交的任务文本。
+        return: 任务总结及可用的程序核验状态。
+        '''
         with task_usage():
             result = self.agents["master"].run(prompt)
             if self.context.main_tex_path:
@@ -47,7 +53,18 @@ class Application:
                     logger.warning("保存 %s 长期记忆失败: %s", name, exc)
 
     def __enter__(self) -> "Application":
+        '''进入应用上下文，供 with 语句使用。
+
+        return: 当前应用实例。
+        '''
         return self
 
     def __exit__(self, exc_type, exc, traceback) -> None:
+        '''退出应用上下文并关闭资源，不抑制异常。
+
+        paras:
+            exc_type: with 代码块抛出的异常类型，无异常时为 None。
+            exc: 异常实例，无异常时为 None。
+            traceback: 异常回溯对象，无异常时为 None。
+        '''
         self.close()

@@ -1,19 +1,16 @@
 import json as json_mod
-import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
+from ....domain.citation_syntax import STANDARD_CITATION, citation_keys
 
 from ...base import Tool
-from ....domain.paper import Paper, Source
-from ....core.llm import get_tool_llm
+from ....domain.paper import Paper
 from .._safe_path import safe_resolve
-from .._cite_key import make_cite_key
-from .common import _escape_latex, _escape_bibtex_fields
 
 class ScanCitationsTool(Tool):
     """扫描 .tex 中的引用并返回上下文"""
 
     def __init__(self):
+        '''初始化 TeX 引用扫描工具。
+        '''
         super().__init__(
             name="scan_citations",
             description="扫描 LaTeX 文件中的 \\cite{...} 引用，提取引用上下文。"
@@ -21,10 +18,7 @@ class ScanCitationsTool(Tool):
         )
 
     def get_parameters(self) -> dict:
-        """返回工具参数的 JSON Schema 定义。
-
-        return: input_schema 字典
-        """
+        """返回工具参数的 JSON Schema 定义。"""
         return {
             "type": "object",
             "properties": {
@@ -50,17 +44,9 @@ class ScanCitationsTool(Tool):
             return json_mod.dumps({"error": f"文件不存在: {tex_path}"})
         content = path.read_text(encoding="utf-8", errors="replace")
 
-        # \cite/\citep/\citet/\citeauthor/\citeyear 变体，支持可选参数 [..] 与多 key {k1,k2}
-        cite_pattern = re.compile(
-            r'\\(?:cite|citet|citep|citeauthor|citeyear)'
-            r'(?:\s*\[[^\]]*\])*'
-            r'\s*\{([^}]+)\}'
-        )
-
         citations = []
-        for match in cite_pattern.finditer(content):
-            keys_str = match.group(1)
-            keys = [k.strip() for k in keys_str.split(",") if k.strip()]
+        for match in STANDARD_CITATION.finditer(content):
+            keys = citation_keys(match)
             start = match.start()
             end = match.end()
             ctx_start = max(0, start - 200)
@@ -84,6 +70,8 @@ class LookupPaperInfoTool(Tool):
     """从文献库按 cite_key 查询论文元数据（需先 set_reference_library 注入库）"""
 
     def __init__(self):
+        '''初始化引用键对应的文献信息查询工具。
+        '''
         super().__init__(
             name="lookup_paper_info",
             description="从文献库中查找指定论文的标题、摘要等元数据。输入 cite_key。"
@@ -99,10 +87,7 @@ class LookupPaperInfoTool(Tool):
         self._reference_library = refs
 
     def get_parameters(self) -> dict:
-        """返回工具参数的 JSON Schema 定义。
-
-        return: input_schema 字典
-        """
+        """返回工具参数的 JSON Schema 定义。"""
         return {
             "type": "object",
             "properties": {
@@ -139,6 +124,8 @@ class ListCiteKeysTool(Tool):
     """返回文献库中所有文献的 cite_key 列表"""
 
     def __init__(self):
+        '''初始化文献引用键列表工具。
+        '''
         super().__init__(
             name="list_cite_keys",
             description="返回 reference_library 中所有文献的 cite_key，每行一个。"
@@ -155,10 +142,7 @@ class ListCiteKeysTool(Tool):
         self._reference_library = refs
 
     def get_parameters(self) -> dict:
-        """返回工具参数的 JSON Schema 定义。
-
-        return: input_schema 字典
-        """
+        """返回工具参数的 JSON Schema 定义。"""
         return {
             "type": "object",
             "properties": {},

@@ -11,11 +11,12 @@ __pycache__/
 venv/
 
 # ===== 运行时产物 =====
-logs/
+/logs/
 memory/*.json
 .transcripts/
 .task_outputs/
 .cache/pdf_metadata/
+resources/memory_embedding/
 
 # ===== example/：仅上传空目录结构，具体文件一律不上传 =====
 /example/**
@@ -25,3 +26,6 @@ memory/*.json
 # ===== 按要求不上传的内容 =====
 note.md
 PROJECT_LOG.md
+/AGENTS.md
+/tests/
+/todo.md

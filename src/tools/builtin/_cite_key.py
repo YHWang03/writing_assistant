@@ -25,3 +25,14 @@ def make_cite_key(authors: str, year: int, title: str) -> str:
     except IndexError:
         first_word = "paper"
     return f"{last_name}{year}{first_word}"
+def title_key(title):
+    '''规范化标题，供元数据补全匹配使用，不用于存在性验证。
+
+    paras:
+        title: 原始文献标题。
+    return: 去重音、统一大小写和分隔符后的标题。
+    '''
+    import re
+    import unicodedata
+    value = unicodedata.normalize('NFKD', title).casefold()
+    return ' '.join(re.findall(r'[^\W_]+', ''.join(c for c in value if not unicodedata.combining(c))))

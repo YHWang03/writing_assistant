@@ -10,6 +10,8 @@ class ReadContextTool(Tool):
     """读取当前 Agent 有权访问的 PaperContext 字段"""
 
     def __init__(self):
+        '''初始化共享上下文读取工具，等待绑定受控上下文。
+        '''
         super().__init__(
             name="read_context",
             description="读取当前 Agent 可访问的上下文信息（论文路径、创新点、"
@@ -26,10 +28,7 @@ class ReadContextTool(Tool):
         self._context_view = context_view
 
     def get_parameters(self) -> dict:
-        """返回工具参数的 JSON Schema 定义。
-
-        return: input_schema 字典
-        """
+        """返回工具参数的 JSON Schema 定义。"""
         return {
             "type": "object",
             "properties": {

@@ -12,6 +12,8 @@ class CompileLatexTool(Tool):
     """编译 .tex 为 PDF，按需执行 latex + bibtex 多轮编译（subprocess 调终端命令）"""
 
     def __init__(self):
+        '''初始化 LaTeX 编译工具的名称和使用说明。
+        '''
         super().__init__(
             name="compile_latex",
             description="编译 LaTeX 文件生成 PDF。自动检测是否需要 bibtex，"
@@ -20,10 +22,7 @@ class CompileLatexTool(Tool):
         )
 
     def get_parameters(self) -> dict:
-        """返回工具参数的 JSON Schema 定义。
-
-        return: input_schema 字典
-        """
+        """返回工具参数的 JSON Schema 定义。"""
         return {
             "type": "object",
             "properties": {
@@ -81,43 +80,11 @@ class CompileLatexTool(Tool):
             if final_pdf.exists():
                 final_pdf.unlink()
 
-            steps = []
-            all_stdout = []
-
-            r1 = self._run_latex(compiler, tex, out_dir, work_dir)
-            steps.append({"step": f"{compiler} (1)", "return_code": r1["rc"]})
-            all_stdout.append(r1["stdout"])
-            crash1 = self._is_crash(r1["rc"])
-
-            if crash1:
-                all_tried.append({"compiler": compiler, "result": "crashed on pass 1", "rc": r1["rc"]})
+            steps, all_stdout, failure, last_rc = self._run_passes(
+                compiler, tex, out_dir, work_dir, needs_bibtex)
+            if failure:
+                all_tried.append(failure)
                 continue
-
-            if needs_bibtex:
-                r_bib = self._run_bibtex(tex, out_dir, work_dir)
-                steps.append({"step": "bibtex", "return_code": r_bib["rc"]})
-                all_stdout.append(r_bib["stdout"])
-
-                r2 = self._run_latex(compiler, tex, out_dir, work_dir)
-                steps.append({"step": f"{compiler} (2)", "return_code": r2["rc"]})
-                all_stdout.append(r2["stdout"])
-                if self._is_crash(r2["rc"]):
-                    all_tried.append({"compiler": compiler, "result": "crashed on pass 2", "rc": r2["rc"]})
-                    continue
-
-                r3 = self._run_latex(compiler, tex, out_dir, work_dir)
-                steps.append({"step": f"{compiler} (3)", "return_code": r3["rc"]})
-                all_stdout.append(r3["stdout"])
-                if self._is_crash(r3["rc"]):
-                    all_tried.append({"compiler": compiler, "result": "crashed on pass 3", "rc": r3["rc"]})
-                    continue
-            else:
-                r2 = self._run_latex(compiler, tex, out_dir, work_dir)
-                steps.append({"step": f"{compiler} (2)", "return_code": r2["rc"]})
-                all_stdout.append(r2["stdout"])
-                if self._is_crash(r2["rc"]):
-                    all_tried.append({"compiler": compiler, "result": "crashed on pass 2", "rc": r2["rc"]})
-                    continue
 
             combined = "\n".join(all_stdout)
             success = final_pdf.exists()
@@ -138,7 +105,7 @@ class CompileLatexTool(Tool):
                     "_version": "V3",
                 })
             else:
-                all_tried.append({"compiler": compiler, "result": "compiled but no PDF", "rc": r3.get("rc", r2["rc"]) if needs_bibtex else r2["rc"]})
+                all_tried.append({"compiler": compiler, "result": "compiled but no PDF", "rc": last_rc})
                 continue
 
         return json_mod.dumps({
@@ -148,6 +115,32 @@ class CompileLatexTool(Tool):
             "all_tried": all_tried,
             "_version": "V3",
         })
+
+    def _run_passes(self, compiler, tex, out_dir, work_dir, needs_bibtex):
+        '''执行两轮或三轮 LaTeX 编译，按需穿插 BibTeX；编译器崩溃时提前停止。
+
+        paras:
+            compiler: 使用的 LaTeX 编译器名称。
+            tex: 主 TeX 文件 Path。
+            out_dir: 编译输出目录。
+            work_dir: 编译进程的工作目录。
+            needs_bibtex: True 时在第二轮 LaTeX 前执行 BibTeX，并增加第三轮 LaTeX。
+        return: 步骤记录、各轮输出、崩溃信息（正常为 None）、最后一轮 LaTeX 返回码的四元组。
+        '''
+        steps, outputs = [], []
+        passes = 3 if needs_bibtex else 2
+        for number in range(1, passes + 1):
+            if number == 2 and needs_bibtex:
+                bib = self._run_bibtex(tex, out_dir, work_dir)
+                steps.append({"step": "bibtex", "return_code": bib["rc"]})
+                outputs.append(bib["stdout"])
+            result = self._run_latex(compiler, tex, out_dir, work_dir)
+            steps.append({"step": f"{compiler} ({number})", "return_code": result["rc"]})
+            outputs.append(result["stdout"])
+            if self._is_crash(result["rc"]):
+                failure = {"compiler": compiler, "result": f"crashed on pass {number}", "rc": result["rc"]}
+                return steps, outputs, failure, result["rc"]
+        return steps, outputs, None, result["rc"]
 
     def _is_crash(self, rc: int) -> bool:
         """检测返回码是否为进程崩溃。
@@ -255,16 +248,15 @@ class ParseLatexLogTool(Tool):
     """解析 LaTeX 编译日志，提取 error 与 warning"""
 
     def __init__(self):
+        '''初始化 LaTeX 日志解析工具的名称和使用说明。
+        '''
         super().__init__(
             name="parse_latex_log",
             description="解析 LaTeX 编译日志，提取错误和警告信息。"
         )
 
     def get_parameters(self) -> dict:
-        """返回工具参数的 JSON Schema 定义。
-
-        return: input_schema 字典
-        """
+        """返回工具参数的 JSON Schema 定义。"""
         return {
             "type": "object",
             "properties": {

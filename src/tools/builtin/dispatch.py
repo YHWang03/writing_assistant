@@ -7,6 +7,11 @@ class DispatchTaskTool(Tool):
     """分派任务给指定的子 Agent 执行（依赖注入 dispatch_func）"""
 
     def __init__(self, dispatch_func=None):
+        '''初始化任务派发工具并绑定可选派发回调。
+
+        paras:
+            dispatch_func: 将任务派发给指定 Agent 的回调。
+        '''
         super().__init__(
             name="dispatch_task",
             description=(
@@ -27,10 +32,7 @@ class DispatchTaskTool(Tool):
         self._dispatch = dispatch_func
 
     def get_parameters(self) -> dict:
-        """返回工具参数的 JSON Schema 定义。
-
-        return: input_schema 字典
-        """
+        """返回工具参数的 JSON Schema 定义。"""
         return {
             "type": "object",
             "properties": {

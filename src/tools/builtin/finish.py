@@ -7,6 +7,8 @@ class FinishTool(Tool):
     """Agent 调用 finish 表示任务完成，loop 检测到此调用后直接退出"""
 
     def __init__(self):
+        '''初始化任务结束工具，供运行器识别完成总结。
+        '''
         super().__init__(
             name="finish",
             description="任务完成时调用此工具，传入总结报告。调用后对话结束。"
@@ -14,10 +16,7 @@ class FinishTool(Tool):
         )
 
     def get_parameters(self) -> dict:
-        """返回工具参数的 JSON Schema 定义。
-
-        return: input_schema 字典
-        """
+        """返回工具参数的 JSON Schema 定义。"""
         return {
             "type": "object",
             "properties": {

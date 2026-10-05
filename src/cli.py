@@ -15,12 +15,22 @@ logger = logging.getLogger(__name__)
 
 
 def _parser() -> argparse.ArgumentParser:
+    '''构造命令行参数解析器。
+
+    return: 支持配置文件路径参数的 ArgumentParser。
+    '''
     parser = argparse.ArgumentParser(description="多 Agent 学术论文写作助手")
     parser.add_argument("--config", default="config.yaml", help="YAML 配置文件路径")
     return parser
 
 
 def interactive(config_path: str) -> int:
+    '''加载配置并循环接收用户任务，退出时关闭应用。
+
+    paras:
+        config_path: YAML 配置文件路径。
+    return: 正常退出时返回状态码 0。
+    '''
     config = load_config(config_path)
     with create_application(config) as app:
         logger.info("=" * 60)
@@ -48,6 +58,12 @@ def interactive(config_path: str) -> int:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    '''初始化日志、解析命令行参数并启动交互入口。
+
+    paras:
+        argv: 命令行参数序列；None 表示读取进程参数。
+    return: 退出状态码：正常为 0，配置错误为 2。
+    '''
     args = _parser().parse_args(argv)
     setup_logging(PROJECT_DIR / "logs")
     try:

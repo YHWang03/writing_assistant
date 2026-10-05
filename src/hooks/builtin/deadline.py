@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 
 # 判定「已产出文件」的工具集合（宽语义：调用尝试即算，不论成败）
 OUTPUT_TOOLS = {
-    "write_file", "write_bib_file",
+    "write_file",
     "generate_bib_from_ref_library", "generate_bibtex",
 }
 
@@ -34,11 +34,7 @@ class DeadlineNudgeHook(Hook):
         self._nudged = False
 
     def reset(self):
-        """清空本 ReAct 轮次的产出尝试与催办标记。
-
-        paras: 无
-        return: 无
-        """
+        """清空本 ReAct 轮次的产出尝试与催办标记。"""
         self._wrote_output = False
         self._nudged = False
 

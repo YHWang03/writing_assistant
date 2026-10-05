@@ -63,34 +63,51 @@ class PaperContext:
         self.sections[name] = content
 
     def update_reference(self, cite_key: str, changes: dict):
-        """只修改显式传入的字段，保留摘要等已有信息；引用键不可隐式改名。"""
+        '''按引用键更新显式字段，保留其他信息，并同步用户 PDF 的缺失字段和字段来源。
+
+        paras:
+            cite_key: 待更新文献的引用键，不能通过 changes 改名。
+            changes: 字段名到新值的映射；为空、含受保护字段、类型错误或文献不存在时抛出 ValueError。
+        '''
         from dataclasses import fields, replace
-        allowed = {f.name for f in fields(Paper)} - {"cite_key", "source", "provenance_kind", "provenance_title", "source_pdf", "source_fingerprint"}
+        allowed = {f.name for f in fields(Paper)} - {"cite_key", "source", "source_pdf", "source_fingerprint", "metadata_missing", "field_sources", "completion_status", "display_label"}
         if not changes or set(changes) - allowed:
             raise ValueError("无效或空的文献更新字段")
+        # 检查字段类型
         for key, value in changes.items():
-            valid = (isinstance(value, int) and not isinstance(value, bool) if key == "year"
-                     else isinstance(value, list) and all(isinstance(v, str) for v in value) if key == "keywords"
-                     else isinstance(value, dict) and all(isinstance(k, str) and isinstance(v, str) for k, v in value.items()) if key == "bib_fields"
-                     else isinstance(value, str))
+            if key == "year":
+                valid = isinstance(value, int) and not isinstance(value, bool)
+            elif key == "keywords":
+                valid = isinstance(value, list) and all(isinstance(v, str) for v in value)
+            elif key == "bib_fields":
+                valid = isinstance(value, dict) and all(
+                    isinstance(k, str) and isinstance(v, str) for k, v in value.items())
+            else:
+                valid = isinstance(value, str)
             if not valid:
                 raise ValueError(f"字段类型错误: {key}")
+        
         for i, ref in enumerate(self.reference_library):
             if ref.cite_key == cite_key:
                 self.reference_library[i] = replace(ref, **deepcopy(changes))
-                if "title" in changes:
-                    from .reference_provenance import title_key
-                    if title_key(changes['title']) != title_key(ref.title):
-                        self.reference_library[i].provenance_kind = ""
-                        self.reference_library[i].provenance_title = ""
-                        self.reference_library[i].source_pdf = ""
-                        self.reference_library[i].source_fingerprint = ""
+                updated = self.reference_library[i]
+                if ref.source_pdf:
+                    updated.metadata_missing = [k for k in ('title', 'authors', 'year', 'abstract') if not getattr(updated, k)]
+                    for key in changes.keys() & {'title', 'authors', 'year', 'abstract'}:
+                        updated.field_sources[key] = 'agent_edit'
                 return
         raise ValueError(f"文献不存在: {cite_key}")
 
     def remove_reference(self, cite_key: str):
+        '''确认文献存在且未被正文引用后，从共享文献库删除对应记录。
+
+        paras:
+            cite_key: 目标文献的引用键。
+        '''
         if cite_key not in self.get_all_cite_keys():
             raise ValueError(f"文献不存在: {cite_key}")
+        from .reference_usage import assert_unreferenced
+        assert_unreferenced(cite_key, self.main_tex_path, self.output_dir, self.sections)
         self.reference_library[:] = [r for r in self.reference_library if r.cite_key != cite_key]
 
     def get_section(self, name: str) -> str:
@@ -103,11 +120,7 @@ class PaperContext:
         return self.sections.get(name, "")
 
     def get_all_cite_keys(self) -> list[str]:
-        """获取全部文献 cite_key。
-
-        paras: 无
-        return: cite_key 列表
-        """
+        """获取全部文献 cite_key。"""
         return [ref.cite_key for ref in self.reference_library if ref.cite_key]
 
     def log_modification(self, agent: str, action: str, detail: str):
@@ -205,22 +218,38 @@ class AgentContextView:
         self._context.add_reference(ref)
 
     def read(self, field: str):
-        """Return an immutable snapshot of a readable field."""
+        '''读取授权字段的只读快照，不直接暴露上下文中的可变容器。
+
+        paras:
+            field: 上下文字段名，须在当前视图的可读范围内。
+        return: 字段的冻结副本；无权限时由权限检查抛出异常。
+        '''
         if field not in self._readable:
             raise AttributeError(f"AgentContextView: 字段 '{field}' 不可读")
         value = getattr(self._context, field)
         if isinstance(value, list):
             return tuple(deepcopy(value))
         if isinstance(value, dict):
-            return MappingProxyType(deepcopy(value))
+            return MappingProxyType(deepcopy(value)) # 可读不可改的深拷贝
         return value
 
     def update_reference(self, cite_key: str, changes: dict):
+        '''校验文献库写权限后，通过共享上下文更新文献字段。
+
+        paras:
+            cite_key: 目标文献的引用键。
+            changes: 需要更新的字段及新值字典。
+        '''
         if "reference_library" not in self._writable:
             raise AttributeError("AgentContextView: 无权修改 reference_library")
         self._context.update_reference(cite_key, changes)
 
     def remove_reference(self, cite_key: str):
+        '''校验文献库写权限后，通过共享上下文执行受保护的文献删除。
+
+        paras:
+            cite_key: 目标文献的引用键。
+        '''
         if "reference_library" not in self._writable:
             raise AttributeError("AgentContextView: 无权修改 reference_library")
         self._context.remove_reference(cite_key)
@@ -250,7 +279,11 @@ class AgentContextView:
         self._context.set_section(name, content)
 
     def set_main_tex_path(self, path: str) -> None:
-        """Record the generated main TeX path through an authorized command."""
+        '''通过授权命令记录主 TeX 文件路径，写入前检查字段权限。
+
+        paras:
+            path: 生成的主 TeX 文件路径。
+        '''
         if "main_tex_path" not in self._writable:
             raise AttributeError("AgentContextView: 无权修改 main_tex_path")
         self._context.main_tex_path = path
@@ -267,11 +300,7 @@ class AgentContextView:
         return self._context.get_section(name)
 
     def get_all_cite_keys(self) -> list[str]:
-        """权限校验后读取全部 cite_key。
-
-        paras: 无
-        return: cite_key 列表
-        """
+        """权限校验后读取全部 cite_key。"""
         if "reference_library" not in self._readable:
             raise AttributeError("AgentContextView: 无权读取 reference_library")
         return self._context.get_all_cite_keys()
@@ -290,11 +319,7 @@ class AgentContextView:
         self._context.log_modification(agent, action, detail)
 
     def get_readable_summary(self) -> str:
-        """生成可读字段摘要（注入 Agent system prompt）。
-
-        paras: 无
-        return: 逐字段摘要文本
-        """
+        """生成可读字段摘要（注入 Agent system prompt）。"""
         lines = ["## Your Context Access"]
         lines.append(f"You can read: {sorted(self._readable)}")
         lines.append(f"You can write: {sorted(self._writable)}")

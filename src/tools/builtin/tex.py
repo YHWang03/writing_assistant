@@ -1,11 +1,7 @@
-"""文件读写工具 — 文本读取/写入/列目录/删除，带进程级缓存与路径沙箱。"""
+"""文件读写工具 — 文本读取/写入/列目录/删除，实时读取磁盘并限制路径。"""
 
-import glob as _glob
 from ..base import Tool
-from ._safe_path import safe_resolve, _PROJECT_ROOT
-
-# 进程级文件内容缓存，避免同一文件被多个 Agent 重复读取
-_file_cache: dict[str, str] = {}
+from ._safe_path import safe_resolve, _PROJECT_ROOT, ScopedFileRead
 
 # .tex 单次覆盖写入上限（字符），超过则拒绝并强制分段（先 write 再 append）
 _MAX_TEX_WRITE_CHARS = 8000
@@ -18,10 +14,12 @@ _BINARY_SUFFIXES = {
 }
 
 
-class ReadFileTool(Tool):
+class ReadFileTool(ScopedFileRead, Tool):
     """读取文件文本，支持 head/tail 两种模式"""
 
     def __init__(self):
+        '''初始化文本读取工具及空 Agent 身份。
+        '''
         super().__init__(
             name="read_file",
             description="读取文件内容。支持两种模式：head（默认，从开头读取）和 tail（从末尾向前读取）。"
@@ -38,10 +36,7 @@ class ReadFileTool(Tool):
         self._agent_name = name
 
     def get_parameters(self) -> dict:
-        """返回工具参数的 JSON Schema 定义。
-
-        return: input_schema 字典
-        """
+        """返回工具参数的 JSON Schema 定义。"""
         return {
             "type": "object",
             "properties": {
@@ -75,7 +70,7 @@ class ReadFileTool(Tool):
                 二进制/非 UTF-8 文件返回指路提示，其他失败返回 "Error: ..." 字符串
         """
         try:
-            path = safe_resolve(file_path)
+            path = self.resolve_read(file_path)
         except ValueError as e:
             return f"Error: {e}"
 
@@ -92,21 +87,19 @@ class ReadFileTool(Tool):
 
         if path.suffix.lower() in _BINARY_SUFFIXES:
             if path.suffix.lower() == ".pdf":
+                if self._agent_name == 'LiteratureAgent':
+                    return '提示：read_file 不读取 PDF。请使用 parse_and_store；解析及自动补全后的剩余缺项应保留并汇报，不再翻页补全。'
                 return (
                     f"提示：{file_path} 是 PDF 文件，read_file 只读文本。\n"
-                    "PDF 正文请用 get_paper_text（读取原文），元数据请用 parse_pdf / parse_and_store。"
+                    "PDF 元数据由 LiteratureAgent 使用 parse_and_store 提取；已有文献信息请查询文献库。"
                 )
             return (
                 f"提示：{file_path} 是二进制文件（{path.suffix}），read_file 只读文本，无法读取。"
             )
 
         try:
-            cache_key = str(path.resolve())
-            if cache_key in _file_cache:
-                full_content = _file_cache[cache_key]
-            else:
-                full_content = path.read_text(encoding="utf-8")
-                _file_cache[cache_key] = full_content
+            # 其他工具、编译器及用户都可能修改文件，不能按路径复用旧内容。
+            full_content = path.read_text(encoding="utf-8")
             total_len = len(full_content)
 
             if mode == "tail":
@@ -123,7 +116,7 @@ class ReadFileTool(Tool):
         except UnicodeDecodeError:
             return (
                 f"提示：{file_path} 不是 UTF-8 文本文件（可能是二进制或非 UTF-8 编码）。\n"
-                "PDF 请用 get_paper_text / parse_pdf；其他文本文件请确认编码后改用对应工具。"
+                "PDF 元数据由 LiteratureAgent 使用 parse_and_store 提取；其他文本文件请先确认编码。"
             )
         except Exception as e:
             return f"Error: 读取失败 — {e}"
@@ -133,6 +126,8 @@ class WriteFileTool(Tool):
     """写入文本文件，支持 write(覆盖)/append(追加)/replace(局部替换) 三种模式"""
 
     def __init__(self):
+        '''初始化文本写入工具及空 Agent 身份。
+        '''
         super().__init__(
             name="write_file",
             description="写入文本文件。支持三种模式："
@@ -151,10 +146,7 @@ class WriteFileTool(Tool):
         self._agent_name = name
 
     def get_parameters(self) -> dict:
-        """返回工具参数的 JSON Schema 定义。
-
-        return: input_schema 字典
-        """
+        """返回工具参数的 JSON Schema 定义。"""
         return {
             "type": "object",
             "properties": {
@@ -183,6 +175,7 @@ class WriteFileTool(Tool):
         """写入文本文件。
 
         paras:
+            **kwargs: 文件写入参数集合，支持下列字段。
             file_path: 文件路径
             content: 要写入或替换的内容
             mode: write 覆盖 / append 追加 / replace 局部替换
@@ -237,7 +230,6 @@ class WriteFileTool(Tool):
                     )
                 result = existing.replace(old_text, content, 1)
                 path.write_text(result, encoding="utf-8")
-                _file_cache.pop(str(path.resolve()), None)
                 return (
                     f"文件已替换: {file_path} ({len(result)} 字符, "
                     f"替换了 {len(old_text)} → {len(content)} 字符)"
@@ -248,7 +240,6 @@ class WriteFileTool(Tool):
                     existing = path.read_text(encoding="utf-8")
                     content = existing + content
                 path.write_text(content, encoding="utf-8")
-                _file_cache.pop(str(path.resolve()), None)
                 return f"文件已追加: {file_path} ({len(content)} 字符)"
 
             else:  # mode == "write"
@@ -261,17 +252,18 @@ class WriteFileTool(Tool):
                         f"单次写入请控制在 {_MAX_TEX_WRITE_CHARS} 字符以内。"
                     )
                 path.write_text(content, encoding="utf-8")
-                _file_cache.pop(str(path.resolve()), None)
                 return f"文件已写入: {file_path} ({len(content)} 字符)"
 
         except Exception as e:
             return f"Error: 写入失败 — {e}"
 
 
-class ListFilesTool(Tool):
+class ListFilesTool(ScopedFileRead, Tool):
     """列出目录内容（含文件大小）"""
 
     def __init__(self):
+        '''初始化目录列表工具。
+        '''
         super().__init__(
             name="ls",
             description="列出指定目录下的文件和子目录。输入目录路径，"
@@ -279,10 +271,7 @@ class ListFilesTool(Tool):
         )
 
     def get_parameters(self) -> dict:
-        """返回工具参数的 JSON Schema 定义。
-
-        return: input_schema 字典
-        """
+        """返回工具参数的 JSON Schema 定义。"""
         return {
             "type": "object",
             "properties": {
@@ -304,7 +293,7 @@ class ListFilesTool(Tool):
         if not dir_path:
             dir_path = str(_PROJECT_ROOT)
         try:
-            path = safe_resolve(dir_path)
+            path = self.resolve_read(dir_path, directory=True)
         except ValueError as e:
             return f"Error: {e}"
         if not path.exists():
@@ -314,6 +303,8 @@ class ListFilesTool(Tool):
         try:
             items = []
             for entry in sorted(path.iterdir()):
+                if self.read_policy is not None and not self.read_policy.visible(entry):
+                    continue
                 tag = "DIR" if entry.is_dir() else "FILE"
                 size = ""
                 if entry.is_file():
@@ -345,6 +336,8 @@ class DeleteFileTool(Tool):
     """按 glob 模式删除文件，常用于清理 LaTeX 辅助文件"""
 
     def __init__(self):
+        '''初始化按文件模式清理 LaTeX 辅助文件的工具。
+        '''
         super().__init__(
             name="delete_files",
             description="按 glob 模式删除指定目录下的文件。"
@@ -354,10 +347,7 @@ class DeleteFileTool(Tool):
         )
 
     def get_parameters(self) -> dict:
-        """返回工具参数的 JSON Schema 定义。
-
-        return: input_schema 字典
-        """
+        """返回工具参数的 JSON Schema 定义。"""
         return {
             "type": "object",
             "properties": {
@@ -402,7 +392,6 @@ class DeleteFileTool(Tool):
                     try:
                         f.unlink()
                         deleted.append(f.name)
-                        _file_cache.pop(str(f.resolve()), None)
                     except OSError as e:
                         errors.append(f"{f.name}: {e}")
 

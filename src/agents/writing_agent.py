@@ -37,11 +37,7 @@ class WritingAgent(Agent):
         self._setup_declared_components()
 
     def _sync_context_to_tools(self):
-        """将 PaperContext 中的 reference_library 与 context 注入到各工具。
-
-        paras: 无
-        return: 无
-        """
+        """将 PaperContext 中的 reference_library 与 context 注入到各工具。"""
         if self.context is None:
             return
         references = self.context.get_references()

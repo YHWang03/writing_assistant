@@ -12,6 +12,11 @@ label{display:flex;flex-direction:column;gap:6px;font-size:13px}select,input,but
 <body><main><a href="../index.html">← 所有运行</a><h1 id="title">模型调用报告</h1>
 <p id="meta"></p><p>统计仅使用 API 已知用量；缓存字段单独统计，不与输入相加。SDK 内部自动重试的独立用量不可见。时间按浏览器本地时区显示。</p>
 <noscript>请启用 JavaScript 以查看和筛选本地报告。</noscript>
+<section class="panel"><h2>原始事件导入与执行时间线</h2>
+<p>选取一个 JSONL；可同时选取对应 .details 目录中的 JSON 文件。仅在浏览器本地读取。未配对的开始事件代表“未记录结束”，不一定仍在执行。SDK 调用耗时包含内部重试，非流式接口没有首 token 时间。</p>
+<input id="loadlogs" type="file" multiple accept=".jsonl,.json"><p id="loadstatus"></p>
+<div class="toolbar"><input id="tracequery" placeholder="搜索事件、Agent、工具、状态或 ID"><select id="tracesort"><option value="time">时间顺序</option><option value="slow">最慢优先</option><option value="unfinished">仅未记录结束</option></select><button id="traceprev">上一页</button><span id="tracepage"></span><button id="tracenext">下一页</button></div>
+<p id="tracestats"></p><div class="scroll"><table><thead><tr><th>时间 / 相对秒</th><th>事件</th><th>Agent / 工具 / 后端</th><th>状态 / 秒</th><th>跨度与详情</th></tr></thead><tbody id="traceevents"></tbody></table></div></section>
 <section class="panel"><div class="filters" id="filters"></div><div class="toolbar" style="margin-top:14px"><button id="reset">清除筛选</button><span id="count"></span></div></section>
 <section class="cards" id="cards"></section>
 <section class="panel"><h2>任务状态</h2><div id="tasks"></div></section>
@@ -22,8 +27,9 @@ label{display:flex;flex-direction:column;gap:6px;font-size:13px}select,input,but
 </main><script type="application/json" id="data">__REPORT_DATA__</script>
 <script>
 'use strict';
-const data=JSON.parse(document.getElementById('data').textContent),events=data.events;
-const calls=events.filter(e=>e.event==='llm_call');
+let data=JSON.parse(document.getElementById('data').textContent),events=data.events;
+let calls=events.filter(e=>e.event==='llm_call');
+const detailFiles=new Map(Object.entries(data.details??{}));
 const $=id=>document.getElementById(id), number=v=>typeof v==='number'&&Number.isFinite(v), fmt=v=>number(v)?v.toLocaleString():'未知';
 const text=(tag,value)=>{const el=document.createElement(tag);el.textContent=value;return el};
 const key=(e,k)=>String(e[k]??'未归属');
@@ -41,6 +47,61 @@ function render(){const rows=filtered();$('count').textContent='当前 '+rows.le
 const group=$('group').value,groups=new Map();for(const e of rows){const k=key(e,group);if(!groups.has(k))groups.set(k,[]);groups.get(k).push(e)}$('ranking').replaceChildren();for(const [k,items] of [...groups].sort((a,b)=>(sum(b[1],'input_tokens').value??-1)-(sum(a[1],'input_tokens').value??-1))){row($('ranking'),[k,items.length,fmt(sum(items,'input_tokens').value),fmt(sum(items,'output_tokens').value),items.filter(e=>e.status==='failed').length,fmt(sum(items,'duration').value)])}if(!rows.length)row($('ranking'),['无匹配调用']);
 $('durations').replaceChildren();for(const [label,lo,hi] of [['< 1 秒',0,1],['1–5 秒',1,5],['5–30 秒',5,30],['≥ 30 秒',30,Infinity]])card($('durations'),label,rows.filter(e=>number(e.duration)&&e.duration>=lo&&e.duration<hi).length);card($('durations'),'耗时未知',rows.filter(e=>!number(e.duration)).length);
 const summaries=new Map();for(const e of events){if(e.task_id){const old=summaries.get(e.task_id);if(!old||e.event==='task_usage')summaries.set(e.task_id,e)}}$('tasks').replaceChildren();for(const [id,e] of summaries){if($('task_id').value&&$('task_id').value!==id)continue;const match=rows.filter(c=>c.task_id===id).length;$('tasks').append(text('p',id+' · '+(e.event==='task_usage'?(e.status==='success'?'执行结束':'异常结束'):'未记录结束事件')+' · 当前筛选 '+match+' 次调用'+(e.event==='task_usage'?' · 任务耗时 '+fmt(e.duration)+' 秒':'')))}if(!summaries.size)$('tasks').append(text('p','没有任务事件；旧版日志无法补回 API 用量。'));
-const sorted=[...rows].sort((a,b)=>{const k={newest:'ts',slowest:'duration',input:'input_tokens'}[$('sort').value];return (number(b[k])?b[k]:-1)-(number(a[k])?a[k]:-1)});const pages=Math.max(1,Math.ceil(rows.length/50));page=Math.min(page,pages-1);$('page').textContent=(page+1)+' / '+pages;$('prev').disabled=page===0;$('next').disabled=page===pages-1;$('calls').replaceChildren();for(const e of sorted.slice(page*50,page*50+50)){const tr=row($('calls'),[number(e.ts)?new Date(e.ts*1000).toLocaleString():'未知',key(e,'agent')+' / '+key(e,'tool'),key(e,'model')+' / '+key(e,'purpose'),e.status??'未知',fmt(e.input_tokens),fmt(e.output_tokens),fmt(e.duration)]);const td=document.createElement('td'),detail=document.createElement('details');detail.append(text('summary','展开'),text('pre',JSON.stringify(e,null,2)));td.append(detail);tr.append(td);if(e.status==='failed')tr.className='bad'}if(!rows.length)row($('calls'),['没有匹配的调用记录'])}
+const sorted=[...rows].sort((a,b)=>{const k={newest:'ts',slowest:'duration',input:'input_tokens'}[$('sort').value];return (number(b[k])?b[k]:-1)-(number(a[k])?a[k]:-1)});const pages=Math.max(1,Math.ceil(rows.length/50));page=Math.min(page,pages-1);$('page').textContent=(page+1)+' / '+pages;$('prev').disabled=page===0;$('next').disabled=page===pages-1;$('calls').replaceChildren();for(const e of sorted.slice(page*50,page*50+50)){const tr=row($('calls'),[number(e.ts)?new Date(e.ts*1000).toLocaleString():'未知',key(e,'agent')+' / '+key(e,'tool'),key(e,'model')+' / '+key(e,'purpose'),e.status??'未知',fmt(e.input_tokens),fmt(e.output_tokens),fmt(e.duration)]);const td=document.createElement('td'),detail=document.createElement('details');detail.append(text('summary','展开'),text('pre',JSON.stringify(e,null,2)));appendCallDetails(detail,e);td.append(detail);tr.append(td);if(e.status==='failed')tr.className='bad'}if(!rows.length)row($('calls'),['没有匹配的调用记录'])}
 $('reset').onclick=()=>{fields.forEach(([k])=>$(k).value='');['from','to','search'].forEach(k=>$(k).value='');page=0;render()};$('group').onchange=render;$('sort').onchange=()=>{page=0;render()};$('prev').onclick=()=>{page--;render()};$('next').onclick=()=>{page++;render()};render();
+function appendCallDetails(parent,event){
+ for(const [field,label] of [['output_detail','完整响应（含 thinking）'],['input_detail','完整请求']]){
+  const ref=event[field],section=document.createElement('details');
+  section.append(text('summary',label));
+  const content=ref?.path?(detailFiles.get(ref.path)??detailFiles.get(ref.path.split('/').pop())):undefined;
+  if(content===undefined){section.append(text('p',ref?.path?'详情未加载，请在上方导入对应 JSON 文件：'+ref.path:'该调用未保存此详情。'));parent.append(section);continue}
+  if(field==='output_detail'){
+   const blocks=Array.isArray(content)?content:content?.content;
+   if(Array.isArray(blocks))for(const block of blocks){
+    const part=document.createElement('details');
+    const kind=block.type??'旧版已过滤内容';
+    part.append(text('summary',kind+(block.name?' · '+block.name:'')));
+    part.append(text('pre',kind==='thinking'?block.thinking??'':kind==='text'?block.text??'':JSON.stringify(block,null,2)));
+    section.append(part);
+   }
+  }
+  const raw=document.createElement('details');raw.append(text('summary','完整 JSON'),text('pre',JSON.stringify(content,null,2)));section.append(raw);parent.append(section);
+ }
+}
+let tracePage=0;
+
+function traceRender(){
+ const ends=new Set(events.filter(e=>e.event?.endsWith('_end')||e.event==='task_usage').map(e=>e.span_id));
+ const pending=e=>e.span_id&&e.event?.endsWith('_start')&&!ends.has(e.span_id);
+ const q=$('tracequery').value.toLowerCase(),mode=$('tracesort').value;
+ const list=events.filter(e=>(mode!=='unfinished'||pending(e))&&JSON.stringify(e).toLowerCase().includes(q));
+ list.sort((a,b)=>mode==='slow'?(b.duration??-1)-(a.duration??-1):(a.ts??0)-(b.ts??0));
+ const pages=Math.max(1,Math.ceil(list.length/100));tracePage=Math.min(tracePage,pages-1);
+ $('tracepage').textContent=(tracePage+1)+' / '+pages;$('traceprev').disabled=!tracePage;$('tracenext').disabled=tracePage>=pages-1;
+ $('tracestats').textContent=events.length+' 个事件 · '+events.filter(pending).length+' 个未配对开始 · 匹配 '+list.length+' 个。耗时单位秒；父跨度包含子跨度，不可重复相加。';
+ $('traceevents').replaceChildren();const base=events.find(e=>number(e.ts))?.ts??0;
+ for(const e of list.slice(tracePage*100,tracePage*100+100)){
+  const tr=row($('traceevents'),[number(e.ts)?new Date(e.ts*1000).toLocaleString()+' / '+(e.ts-base).toFixed(3):'未知',e.event??'unknown',[e.agent,e.tool,e.host].filter(Boolean).join(' / '),(pending(e)?'未记录结束':e.status??'—')+' / '+(number(e.duration)?e.duration.toFixed(3):'—')]);
+  const td=document.createElement('td'),d=document.createElement('details');d.append(text('summary',(e.span_id??e.call_id??'事件详情').slice(0,12)),text('pre',JSON.stringify(e,null,2)));
+  for(const field of ['input_detail','output_detail']){const ref=e[field];if(ref?.path){const content=detailFiles.get(ref.path)??detailFiles.get(ref.path.split('/').pop());d.append(text('p',field+': '+ref.path),text('pre',content===undefined?'请导入对应详情 JSON 文件':JSON.stringify(content,null,2)))}}
+  td.append(d);tr.append(td);
+ }
+}
+$('tracequery').oninput=$('tracesort').onchange=()=>{tracePage=0;traceRender()};
+$('traceprev').onclick=()=>{tracePage--;traceRender()};$('tracenext').onclick=()=>{tracePage++;traceRender()};
+$('loadlogs').onchange=async()=>{
+ try{
+  const files=[...$('loadlogs').files],logs=files.filter(f=>f.name.endsWith('.jsonl'));
+  if(logs.length>1)throw new Error('一次请选择一个 JSONL，避免重复统计。');
+  if(logs.length){const imported=[];let skipped=0;for(const line of (await logs[0].text()).split(/\r?\n/)){if(!line.trim())continue;try{const e=JSON.parse(line);if(!e||Array.isArray(e)||typeof e!=='object')throw new Error();imported.push(e)}catch{skipped++}}
+   data={events:imported,skipped,run:logs[0].name};events=imported;calls=events.filter(e=>e.event==='llm_call');detailFiles.clear();
+   $('title').textContent='调用报告 · '+data.run;$('meta').textContent='本地导入 · '+calls.length+' 次模型调用 · 跳过 '+skipped+' 行损坏日志';
+   for(const [field] of fields){const select=$(field);select.replaceChildren(new Option('全部',''));for(const v of [...new Set(events.map(e=>key(e,field)))].sort())select.add(new Option(v,v))}
+   for(const id of ['from','to','search'])$(id).value='';page=0;render();
+  }
+  for(const file of files.filter(f=>f.name.endsWith('.json')))detailFiles.set(file.name,JSON.parse(await file.text()));
+  $('loadstatus').textContent='已加载 '+events.length+' 个事件、'+detailFiles.size+' 个详情文件';tracePage=0;render();traceRender();
+ }catch(error){$('loadstatus').textContent='导入失败：'+error.message}
+};
+traceRender();
 </script></body></html>

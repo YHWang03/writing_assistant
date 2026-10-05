@@ -39,6 +39,13 @@ CONTEXT_POLICIES = {
 
 
 def _read_text(config: AppConfig, value: str) -> str:
+    '''按项目配置读取 UTF-8 文本，文件不存在时记录警告。
+
+    paras:
+        config: 应用配置对象。
+        value: 文本文件配置路径；空值表示未配置。
+    return: 文件内容；未配置或不存在时为空字符串。
+    '''
     if not value:
         return ""
     path = config.resolve(value)
@@ -49,6 +56,13 @@ def _read_text(config: AppConfig, value: str) -> str:
 
 
 def _image_paths(config: AppConfig, value: str) -> list[str]:
+    '''收集指定目录中受支持的图片文件路径。
+
+    paras:
+        config: 应用配置对象。
+        value: 图片目录配置路径；空值表示未配置。
+    return: 排序后的图片路径列表；目录不可用时为空列表。
+    '''
     if not value:
         return []
     directory = config.resolve(value)
@@ -60,6 +74,12 @@ def _image_paths(config: AppConfig, value: str) -> list[str]:
 
 
 def build_context(config: AppConfig) -> PaperContext:
+    '''从配置和持久文献库构建论文共享上下文。
+
+    paras:
+        config: 应用配置对象。
+    return: 包含输入材料、输出路径和已有文献的 PaperContext。
+    '''
     paths, paper = config.paths, config.paper
     template_dir = config.resolve(paths.template_dir)
     if not template_dir.is_dir() or not any(template_dir.glob("*.tex")):
@@ -86,6 +106,13 @@ def build_context(config: AppConfig) -> PaperContext:
 
 
 def _memory(config: AppConfig, name: str) -> AgentMemory:
+    '''为指定 Agent 创建独立的记忆存储。
+
+    paras:
+        config: 应用配置对象。
+        name: 记忆文件所属的 Agent 角色名。
+    return: 按配置初始化的 AgentMemory。
+    '''
     memory = config.memory
     return AgentMemory(
         path=str(config.resolve(memory.path.format(agent_name=name))),
@@ -96,6 +123,13 @@ def _memory(config: AppConfig, name: str) -> AgentMemory:
 
 
 def build_agents(config: AppConfig, llm: LLM) -> dict[str, object]:
+    '''创建各业务 Agent，按开关绑定记忆并注册 Master 的子 Agent。
+
+    paras:
+        config: 应用配置对象。
+        llm: Agent 使用的语言模型实例。
+    return: 以角色名为键的 Agent 字典。
+    '''
     cfg = config.agents
     if cfg is None:
         raise ValueError("agents 配置尚未初始化")
@@ -104,6 +138,7 @@ def build_agents(config: AppConfig, llm: LLM) -> dict[str, object]:
         "literature": LiteratureAgent(
             llm, cfg.literature.max_steps, cfg.literature.max_tokens,
             cfg.run_mode_for("LiteratureAgent"), cfg.literature.min_relevant or 15,
+            cfg.literature.finish_reserve_steps,
         ),
         "writing": WritingAgent(llm, cfg.writing.max_steps, cfg.writing.max_tokens, cfg.run_mode_for("WritingAgent")),
         "citation": CitationAgent(llm, cfg.citation.max_steps, cfg.citation.max_tokens, cfg.run_mode_for("CitationAgent")),
@@ -119,6 +154,12 @@ def build_agents(config: AppConfig, llm: LLM) -> dict[str, object]:
 
 
 def create_application(config: AppConfig) -> Application:
+    '''装配模型、共享上下文、Agent 和上下文权限。
+
+    paras:
+        config: 应用配置对象。
+    return: 可运行任务并负责资源清理的 Application。
+    '''
     configure_tool_llm(config.llm.flash_model)
     llm = LLM(model=config.llm.model)
     context = build_context(config)

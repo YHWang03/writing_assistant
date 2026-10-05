@@ -34,11 +34,7 @@ class OutputGateHook(Hook):
         self._count = 0
 
     def reset(self):
-        """清空闸门计数。
-
-        paras: 无
-        return: 无
-        """
+        """清空闸门计数。"""
         self._count = 0
 
     def _gate_nudge(self, agent, template: str):

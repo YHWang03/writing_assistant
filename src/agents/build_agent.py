@@ -41,11 +41,7 @@ class BuildAgent(Agent):
         self._setup_declared_components()
 
     def _sync_context_to_tools(self):
-        """将 context 注入到 ReadContextTool。
-
-        paras: 无
-        return: 无
-        """
+        """将 context 注入到 ReadContextTool。"""
         if self.context is not None:
             self.require_tool("read_context").set_context(self.context)
 

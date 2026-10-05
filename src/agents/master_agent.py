@@ -1,6 +1,7 @@
 """MasterAgent — 主 Agent：规划流程并通过 dispatch_task 将任务分派给子 Agent。"""
 
 import logging
+from ..observability.tracing import span, result_status, save_detail
 from ..core.agent import Agent
 from ..core.llm import LLM
 from ..prompts import load_prompt
@@ -56,25 +57,27 @@ class MasterAgent(Agent):
         task: 分派的任务描述
         return: 子 Agent 执行结果或错误信息
         """
-        agent = self.sub_agents.get(agent_name)
-        if agent is None:
-            available = list(self.sub_agents.keys())
-            return f"Error: 子 Agent '{agent_name}' 未注册。可用: {available}"
-        logger.info(f"Dispatching to {agent_name}...")
-        try:
-            result = agent.run(task)
-            logger.info(f"{agent_name} completed.")
-            return result
-        except Exception as e:
-            logger.exception("%s execution failed", agent_name)
-            return f"Error: {agent_name} 执行失败 — {e}"
+        with span("dispatch", from_agent=self.name, to_agent=agent_name,
+                  input_detail=save_detail(task)) as trace:
+            agent = self.sub_agents.get(agent_name)
+            if agent is None:
+                trace["status"] = "failed"
+                available = list(self.sub_agents.keys())
+                return f"Error: 子 Agent '{agent_name}' 未注册。可用: {available}"
+            logger.info(f"Dispatching to {agent_name}...")
+            try:
+                result = agent.run(task)
+                logger.info(f"{agent_name} completed.")
+                trace.update(status=result_status(result), output_detail=save_detail(result))
+                return result
+            except Exception as e:
+                trace.update(status="failed", error_type=type(e).__name__)
+                logger.exception("%s execution failed", agent_name)
+                status = getattr(agent, 'last_run_status', '')
+                return f"Error: {agent_name} 执行失败 — {e}" + (f"\n{status}" if status else '')
 
     def _sync_context_to_tools(self):
-        """将 context 注入到 ReadContextTool。
-
-        paras: 无
-        return: 无
-        """
+        """将 context 注入到 ReadContextTool。"""
         if self.context is not None:
             self.require_tool("read_context").set_context(self.context)
 

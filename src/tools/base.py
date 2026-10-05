@@ -20,6 +20,8 @@ class Tool(ABC):
     def execute(self, **kwargs) -> str:
         """执行工具。
 
+        paras:
+            **kwargs: 符合工具参数定义的关键字参数，由具体工具解析和校验。
         return: 字符串结果
         """
         ...
@@ -44,7 +46,15 @@ class Tool(ABC):
         }
 
     def __str__(self) -> str:
+        '''生成 Tool 的简短文本表示。
+
+        return: 对象的描述字符串。
+        '''
         return f"Tool(name={self.name})"
 
     def __repr__(self) -> str:
+        '''生成 Tool 的简短调试表示。
+
+        return: 对象的描述字符串。
+        '''
         return self.__str__()

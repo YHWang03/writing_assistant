@@ -12,6 +12,16 @@ LIBRARY_FILENAME = "reference_library.json"
 logger = logging.getLogger(__name__)
 
 
+def reference_snapshot(papers):
+    '''生成不受条目顺序影响的完整文献快照，用于判断进展和持久化一致性。
+
+    paras:
+        papers: 结构化文献对象序列。
+    return: 按引用键排序的文献字典列表。
+    '''
+    return sorted((paper.to_dict() for paper in papers), key=lambda item: item['cite_key'])
+
+
 def _library_file(dir_path: str) -> Path:
     """拼出库文件完整路径。
 
@@ -59,6 +69,7 @@ def save_library(path: str, papers: list[Paper], *, replace: bool = False) -> li
     paras:
         path: 文献库目录
         papers: 要合入的 Paper 列表
+        replace: True 写入完整快照（允许删除旧记录）；False 合并旧库并覆盖同名记录。
     return: 合并后的完整 Paper 列表
     """
     existing = [] if replace else load_library(path)
@@ -71,7 +82,13 @@ def save_library(path: str, papers: list[Paper], *, replace: bool = False) -> li
 
 
 def atomic_write(path: Path, text: str):
-    """单文件原子替换，避免中断留下半份文献库。"""
+    '''以 UTF-8 临时文件原子替换目标，自动创建父目录并清理临时文件。
+    要么完整写入新内容，要么保留旧文件
+
+    paras:
+        path: 目标文件的 Path，存在时覆盖。
+        text: 要写入的完整文本；写入或替换失败时向上传播文件异常。
+    '''
     path.parent.mkdir(parents=True, exist_ok=True)
     name = None
     try:
@@ -143,6 +160,8 @@ def _paper_from_dict(d: dict) -> Paper:
         bib_fields=dict(d.get("bib_fields") or {}),
         source_pdf=d.get("source_pdf", ""),
         source_fingerprint=d.get("source_fingerprint", ""),
-        provenance_kind=d.get("provenance_kind", ""),
-        provenance_title=d.get("provenance_title", ""),
+        display_label=d.get("display_label", ""),
+        metadata_missing=list(d.get("metadata_missing") or []),
+        field_sources=dict(d.get("field_sources") or {}),
+        completion_status=d.get("completion_status", ""),
     )

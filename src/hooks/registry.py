@@ -11,7 +11,7 @@ class HookRegistry:
         "pre_finish", "text_only", "stop",
     )
 
-    # 各事件除 agent 外的参数（hook 返回字符串即作为注入提示/拦截结果）
+    # 各事件除 agent 外的参数；post_tool_use 可返回 HookFinish 请求交付结束。
     EVENT_ARGS = {
         "user_prompt_submit": "user_input",
         "pre_step": "step, step_limit, require_finish",
@@ -23,11 +23,7 @@ class HookRegistry:
     }
 
     def __init__(self):
-        """构造空注册表。
-
-        paras: 无
-        return: 无
-        """
+        """构造空注册表。"""
         self._hooks: list[Hook] = []
 
     def register(self, hook: Hook):
@@ -63,18 +59,10 @@ class HookRegistry:
         return None
 
     def reset_all(self):
-        """调用全部 hook 的 reset（ReAct 轮次开始时）。
-
-        paras: 无
-        return: 无
-        """
+        """调用全部 hook 的 reset（ReAct 轮次开始时）。"""
         for hook in self._hooks:
             hook.reset()
 
     def list_names(self) -> list[str]:
-        """列出已注册 hook 类名。
-
-        paras: 无
-        return: 类名列表（注册顺序）
-        """
+        """列出已注册 hook 类名。"""
         return [hook.__class__.__name__ for hook in self._hooks]

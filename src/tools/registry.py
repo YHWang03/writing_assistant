@@ -10,6 +10,8 @@ class ToolRegistry:
     """工具注册表（非全局单例，每个 Agent 独立实例）"""
 
     def __init__(self):
+        '''初始化独立的工具实例和函数工具注册表。
+        '''
         self._tools: dict[str, Tool] = {}
         self._functions: dict[str, dict] = {}
 
@@ -121,7 +123,15 @@ class ToolRegistry:
         return sub
 
     def __len__(self) -> int:
+        '''统计注册的工具实例与函数工具数量。
+
+        return: 已注册工具总数。
+        '''
         return len(self._tools) + len(self._functions)
 
     def __repr__(self) -> str:
+        '''生成 ToolRegistry 的简短调试表示。
+
+        return: 对象的描述字符串。
+        '''
         return f"ToolRegistry(tools={self.list_names()})"

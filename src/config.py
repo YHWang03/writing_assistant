@@ -15,6 +15,12 @@ AGENT_NAMES = ("master", "literature", "writing", "citation", "review", "build")
 
 
 def _memory_switches(value=None) -> dict[str, bool]:
+    '''校验各 Agent 的记忆开关，默认仅开启 Master。
+
+    paras:
+        value: 待处理的配置值。
+    return: 合并默认值和覆盖值后的开关字典。
+    '''
     switches = {name: name == "master" for name in AGENT_NAMES}
     overrides = _mapping(value, "memory.enabled")
     for name, enabled in overrides.items():
@@ -31,6 +37,13 @@ class ConfigError(ValueError):
 
 
 def _mapping(value: Any, path: str) -> Mapping[str, Any]:
+    '''校验配置项是否为映射，空值按空配置处理。
+
+    paras:
+        value: 待处理的配置值。
+        path: 配置项名称，用于错误信息定位。
+    return: 映射对象；None 转为空字典，类型错误抛出 ConfigError。
+    '''
     if value is None:
         return {}
     if not isinstance(value, Mapping):
@@ -39,6 +52,14 @@ def _mapping(value: Any, path: str) -> Mapping[str, Any]:
 
 
 def _positive_int(value: Any, path: str, default: int) -> int:
+    '''读取正整数配置并拒绝布尔值、非整数及非正数。
+
+    paras:
+        value: 待处理的配置值。
+        path: 配置项名称，用于错误信息定位。
+        default: 未提供值时使用的默认值。
+    return: 校验后的整数，未配置时使用默认值。
+    '''
     result = default if value is None else value
     if not isinstance(result, int) or isinstance(result, bool) or result <= 0:
         raise ConfigError(f"{path} 必须是正整数")
@@ -74,6 +95,7 @@ class AgentLimits:
     max_steps: int
     max_tokens: int
     min_relevant: int | None = None
+    finish_reserve_steps: int = 3
 
 
 @dataclass(frozen=True)
@@ -87,6 +109,12 @@ class AgentsConfig:
     build: AgentLimits
 
     def run_mode_for(self, agent_name: str) -> str:
+        '''取得指定 Agent 的运行模式，未覆盖时使用默认模式。
+
+        paras:
+            agent_name: 所属 Agent 的名称。
+        return: 运行模式名称。
+        '''
         return self.run_modes.get(agent_name, self.run_modes["default"])
 
 
@@ -109,12 +137,28 @@ class AppConfig:
     project_dir: Path = PROJECT_DIR
 
     def resolve(self, value: str) -> Path:
+        '''将相对配置路径拼接到项目目录，绝对路径保持不变。
+
+        paras:
+            value: 绝对路径或相对项目目录的路径字符串。
+        return: 解析后的 Path。
+        '''
         path = Path(value)
         return path if path.is_absolute() else self.project_dir / path
 
 
 def _agent_limits(raw: Mapping[str, Any], name: str, steps: int,
                   tokens: int, *, literature: bool = False) -> AgentLimits:
+    '''校验并构建单个 Agent 的步数、输出预算和检索阈值。
+
+    paras:
+        raw: 原始配置映射。
+        name: 目标名称。
+        steps: 默认最大执行步数。
+        tokens: 默认最大输出 token 数。
+        literature: 是否解析文献 Agent 专用的最少相关文献数。
+    return: 对应 Agent 的限制配置。
+    '''
     section = _mapping(raw.get(name), f"agents.{name}")
     min_relevant = None
     if literature:
@@ -124,10 +168,18 @@ def _agent_limits(raw: Mapping[str, Any], name: str, steps: int,
         max_steps=_positive_int(section.get("max_steps"), f"agents.{name}.max_steps", steps),
         max_tokens=_positive_int(section.get("max_tokens"), f"agents.{name}.max_tokens", tokens),
         min_relevant=min_relevant,
+        finish_reserve_steps=_positive_int(section.get('finish_reserve_steps'),
+                                          f'agents.{name}.finish_reserve_steps', 3),
     )
 
 
 def _agents_config(raw_value: Any) -> AgentsConfig:
+    '''解析运行模式和所有 Agent 的执行限制。
+
+    paras:
+        raw_value: 待解析的 agents 配置值。
+    return: 校验后的 AgentsConfig。
+    '''
     raw = _mapping(raw_value, "agents")
     run_mode_value = raw.get("run_mode", "react")
     if isinstance(run_mode_value, str):
@@ -150,7 +202,12 @@ def _agents_config(raw_value: Any) -> AgentsConfig:
 
 
 def load_config(config_path: str | Path) -> AppConfig:
-    """Load and validate YAML configuration."""
+    '''读取并校验 YAML 配置，补充默认值；配置缺失或非法时抛出异常。
+
+    paras:
+        config_path: YAML 配置路径；相对路径以 PROJECT_DIR 为基准。
+    return: 校验后的 AppConfig，project_dir 为配置文件所在目录。
+    '''
     path = Path(config_path)
     if not path.is_absolute():
         path = PROJECT_DIR / path

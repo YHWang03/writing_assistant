@@ -14,22 +14,25 @@ class Message:
         paras:
             content: 消息文本
             role: 消息角色
-        return: 无
         """
         self.content = content
         self.role = role
 
     def to_dict(self) -> dict:
-        """转为 API 格式。
-
-        paras: 无
-        return: {"role": ..., "content": ...} dict
-        """
+        """转为 API 格式。"""
         return {"role": self.role, "content": self.content}
 
     def __str__(self) -> str:
+        '''生成包含消息角色和内容预览的简短文本。
+
+        return: 对象的描述字符串。
+        '''
         preview = self.content[:80].replace("\n", " ")
         return f"[{self.role}] {preview}"
 
     def __repr__(self) -> str:
+        '''生成包含消息角色和内容预览的简短文本。
+
+        return: 对象的描述字符串。
+        '''
         return self.__str__()

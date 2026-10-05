@@ -11,16 +11,15 @@ class ValidateTemplateTool(Tool):
     """验证 LaTeX 模板目录"""
 
     def __init__(self):
+        '''初始化 LaTeX 模板检查工具。
+        '''
         super().__init__(
             name="validate_template",
             description="验证 LaTeX 模板目录是否可用（存在 .tex 文件即可编译）。输入模板目录路径。"
         )
 
     def get_parameters(self) -> dict:
-        """返回工具参数的 JSON Schema 定义。
-
-        return: input_schema 字典
-        """
+        """返回工具参数的 JSON Schema 定义。"""
         return {
             "type": "object",
             "properties": {

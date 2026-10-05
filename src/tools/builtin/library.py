@@ -37,6 +37,8 @@ class ListPaperFilesTool(Tool):
     """列出论文 PDF 并从文件名解析 year + title_query（不解析 PDF 内容）"""
 
     def __init__(self):
+        '''初始化用户 PDF 清单工具及空路径列表。
+        '''
         super().__init__(
             name="list_paper_files",
             description="列出所有可用的论文 PDF（seed 目录 + reference 目录），"
@@ -55,10 +57,7 @@ class ListPaperFilesTool(Tool):
         self._pdf_paths = list(seed_paths or []) + list(ref_paths or [])
 
     def get_parameters(self) -> dict:
-        """返回工具参数的 JSON Schema 定义。
-
-        return: input_schema 字典
-        """
+        """返回工具参数的 JSON Schema 定义。"""
         return {"type": "object", "properties": {}, "required": []}
 
     def execute(self) -> str:
@@ -85,6 +84,8 @@ class FindRelevantPapersTool(Tool):
     """从持久文献库检索与主题相关的文献并自动加入 reference_library"""
 
     def __init__(self):
+        '''初始化持久文献库检索工具及其待注入依赖。
+        '''
         super().__init__(
             name="find_relevant_papers",
             description="从持久文献库中检索与当前论文主题相关的文献，并把相关文献加入 "
@@ -120,10 +121,7 @@ class FindRelevantPapersTool(Tool):
         self._min_relevant = int(n)
 
     def get_parameters(self) -> dict:
-        """返回工具参数的 JSON Schema 定义。
-
-        return: input_schema 字典
-        """
+        """返回工具参数的 JSON Schema 定义。"""
         return {
             "type": "object",
             "properties": {
@@ -254,6 +252,8 @@ class WriteLibraryTool(Tool):
     """把 reference_library 合并写回持久文献库 JSON"""
 
     def __init__(self):
+        '''初始化文献库持久化工具及其待注入依赖。
+        '''
         super().__init__(
             name="write_library",
             description="把 reference_library 中的文献合并写入持久文献库 JSON（按 cite_key 去重），"
@@ -264,7 +264,11 @@ class WriteLibraryTool(Tool):
         self._reference_provider = None
 
     def set_reference_provider(self, provider):
-        """Query an authorized snapshot when the tool executes."""
+        '''绑定文献快照提供器，在工具执行时获取最新授权数据。
+
+        paras:
+            provider: 无参数回调，返回当前 Paper 序列。
+        '''
         self._reference_provider = provider
 
     def set_library_path(self, path: str):
@@ -284,10 +288,7 @@ class WriteLibraryTool(Tool):
         self._reference_library = refs
 
     def get_parameters(self) -> dict:
-        """返回工具参数的 JSON Schema 定义。
-
-        return: input_schema 字典
-        """
+        """返回工具参数的 JSON Schema 定义。"""
         return {"type": "object", "properties": {}, "required": []}
 
     def execute(self) -> str:
